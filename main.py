@@ -12,7 +12,9 @@ import torch
 import torch.nn.functional as tF
 from torch import optim
 from torch.optim.lr_scheduler import StepLR
+from torch.cuda.amp import GradScaler
 from timm.utils import AverageMeter
+import copy
 
 from config import get_config
 from models import build_model
@@ -20,6 +22,8 @@ from datasets import build_loader
 from losses import build_loss
 from logger import create_logger
 from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor, plot_curve, set_seed
+from train.train_loop import train_one_epoch as temporal_train_one_epoch
+
 STAGE_1, STAGE_2 = 0, 1
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -58,6 +62,10 @@ def main_worker(config):
 
     logger.info(f"Creating model with:{config.MODEL.NAME}")
     student, teacher = build_model(config.MODEL)
+    # ensure teacher is a copy of student with requires_grad=False
+    teacher = copy.deepcopy(student)
+    for p in teacher.parameters():
+        p.requires_grad = False
     student.cuda(); teacher.cuda()
     
     criterion, test_criterion = build_loss(config.MODEL)
@@ -107,13 +115,29 @@ def main_worker(config):
     STAGE_1 = 25 # config.TRAIN.EPOCHS
     STAGE_2 = STAGE_1 * 2
 
-
     logger.info(f"Start training: [STAGE_1: {STAGE_1}] [STAGE_2: {STAGE_2}]")
     start_time = time.time()
     epostack, maestack, msestack, lossstack = [], [], [], []
+    
+    scaler = GradScaler()
+    
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         
-        train_one_epoch(config, [teacher, student], criterion, data_loader_train, optimizer, epoch)
+        # use temporal train loop with truncated BPTT, EMA, and AMP support
+        temporal_train_one_epoch(
+            epoch=epoch,
+            dataloader=data_loader_train,
+            student=student,
+            teacher=teacher,
+            optimizer=optimizer,
+            device=torch.device('cuda'),
+            down=getattr(student, 'down', 4),
+            ema_alpha=0.999,
+            scaler=scaler,
+            p2r_loss_cfg=None,
+            amp_enabled=True,
+            min_batch_size=2,
+        )
 
         if epoch == STAGE_2 - 1:
             save_checkpoint(config, "stage2", [teacher, student], max_accuracy, logger)
@@ -142,86 +166,6 @@ def main_worker(config):
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch):
-    teacher, student = model
-    student.train()
-    optimizer.zero_grad()
-
-    num_steps = len(data_loader)
-    batch_time = AverageMeter()
-    loss_meter = AverageMeter()
-    norm_meter = AverageMeter()
-
-    start = time.time()
-    end = time.time()
-    for idx, (limg, lseq, lid, uimg, umasks, uid) in enumerate(data_loader):
-        limg = limg.cuda(non_blocking=True)
-        lseq = [d.cuda(non_blocking=True) for d in lseq]
-
-        lden = student(limg)
-        down_rate = limg.size(-1) // lden.size(-1)
-        loss = criterion(lden, lseq, down_rate)
-
-        if epoch >= STAGE_2:
-            wa_img = uimg[:, :3].cuda(non_blocking=True)
-            sa_img = uimg[:, 3:].cuda(non_blocking=True)
-            cut_img_mask = umasks.cuda(non_blocking=True)
-            cut_den_mask = tF.avg_pool2d(cut_img_mask, kernel_size=down_rate, stride=down_rate) >= 0.5
-
-            sa_img_mask = sa_img * cut_img_mask
-
-            with torch.inference_mode():
-                tu_den = teacher(wa_img)
-
-                tu_mask, tu_seq2, = [], []
-                for tden in tu_den:
-                    tseq = torch.nonzero((tden >= 0).squeeze())
-
-                    peaks = tden.squeeze()[tseq[:, 0], tseq[:, 1]]
-                    threshold = 0.8472978603872036 # sigmoid(0.8472978603872036) = 0.7
-                    tu_mask.append(peaks > threshold)
-
-                    tseq2 = tseq * down_rate + (down_rate - 1) / 2
-                    tu_seq2.append(tseq2)
-
-            weight = min(max((epoch - STAGE_2) * 0.01, 0), 2)
-            su_den = student(sa_img_mask)    
-            semi_loss = criterion(su_den, tu_seq2, down_rate, tu_mask, crop_den_masks=cut_den_mask)
-            loss = (loss + weight * semi_loss) / (1 + weight)
-
-        optimizer.zero_grad()
-        loss.backward()
-
-        grad_norm = get_grad_norm(student.parameters())
-        optimizer.step()
-
-        # # momentum update
-        momentum = 0.998
-        for para_t, para_s in zip(teacher.parameters(), student.parameters()):
-            para_t.data.copy_(para_t.data * momentum + para_s.data * (1.0 - momentum))
-
-        torch.cuda.synchronize()
-
-        loss_meter.update(loss.item(), limg.size(0))
-        norm_meter.update(grad_norm)
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if idx % config.PRINT_FREQ == 0:
-            lr = optimizer.param_groups[0]['lr']
-            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-            etas = batch_time.avg * (num_steps - idx)
-            logger.info(
-                f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr*1e5:.3f}\t'
-                f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'loss {loss_meter.val :.3f} ({loss_meter.avg :.3f})\t'
-                f'grad_norm {norm_meter.val  :.3f} ({norm_meter.avg :.3f})\t'
-                f'mem {memory_used:.0f}MB')
-    epoch_time = time.time() - start
-    logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
-
-
 @torch.no_grad()
 def validate(config, data_loader, model, criterion):
     model.eval()
@@ -233,14 +177,27 @@ def validate(config, data_loader, model, criterion):
     mse_meter = AverageMeter()
 
     end = time.time()
-    for idx, (images, dotseq, imgid) in enumerate(data_loader):
+    for idx, batch in enumerate(data_loader):
+        # handle both old (3 items) and new sequence format (4 items with optional flows)
+        if len(batch) == 3:
+            images, dotseq, imgid = batch
+        else:
+            images, dotseq, imgid = batch[0], batch[1], batch[2]
+        
         images = images.cuda(non_blocking=True)
+        # handle sequences: if images shape is (B,T,C,H,W) take first frame for validation
+        if images.dim() == 5:
+            images = images[:, 0]  # (B,C,H,W)
         dotseq = [d.cuda(non_blocking=True) for d in dotseq]
         cnt = torch.tensor([d.size(0) for d in dotseq]).float().cuda()
         bsize = images.size(0)
         # compute output
         with torch.no_grad():
-            output = model(images)
+            # handle temporal model: call forward with prev_h=None
+            if hasattr(model, 'init_hidden'):
+                output, _ = model(images, prev_h=None)
+            else:
+                output = model(images)
             # outnum = output.sum(dim=(1,2,3)) / config.MODEL.FACTOR
             loss = criterion(output, dotseq, images.size(-1) // output.size(-1)).item()
             outnum = (output > 0).sum(dim=(1, 2, 3))
