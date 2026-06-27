@@ -61,3 +61,60 @@ class SimpleDecoder(nn.Sequential):
         )
         self.up_scale = up_scale
         init.constant_(self[-2].bias, 0.)
+
+
+# --- start add ConvGRU / TemporalUnit ---
+class ConvGRUCell(nn.Module):
+    """
+    Lightweight ConvGRU cell.
+    input: x (B, in_ch, H, W), h_prev (B, hid_ch, H, W)
+    return: h_next (B, hid_ch, H, W)
+    """
+    def __init__(self, in_ch, hid_ch, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.in_ch = in_ch
+        self.hid_ch = hid_ch
+        # gates: z and r
+        self.conv_zr = nn.Conv2d(in_ch + hid_ch, 2 * hid_ch, kernel_size=kernel_size, padding=padding)
+        # candidate
+        self.conv_n = nn.Conv2d(in_ch + hid_ch, hid_ch, kernel_size=kernel_size, padding=padding)
+        # initialization
+        init.kaiming_normal_(self.conv_zr.weight, nonlinearity='relu')
+        init.constant_(self.conv_zr.bias, 0.)
+        init.kaiming_normal_(self.conv_n.weight, nonlinearity='relu')
+        init.constant_(self.conv_n.bias, 0.)
+
+    def forward(self, x, h):
+        # x: (B, in_ch, H, W)
+        # h: (B, hid_ch, H, W)
+        if h is None:
+            # init zeros if needed
+            h = torch.zeros(x.size(0), self.hid_ch, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
+        cat = torch.cat([x, h], dim=1)
+        zr = self.conv_zr(cat)
+        z, r = torch.sigmoid(zr.chunk(2, dim=1))
+        cat_r = torch.cat([x, r * h], dim=1)
+        n = torch.tanh(self.conv_n(cat_r))
+        h_next = (1 - z) * n + z * h
+        return h_next
+
+class TemporalUnit(nn.Module):
+    """
+    Simple wrapper to select temporal mode. Currently implements ConvGRU.
+    mode: 'convgru' (default). TSM could be added here if desired.
+    """
+    def __init__(self, mode='convgru', in_ch=1, hid_ch=32, kernel_size=3):
+        super().__init__()
+        assert mode in ('convgru', 'tsm'), "mode must be 'convgru' or 'tsm'"
+        self.mode = mode
+        if mode == 'convgru':
+            self.cell = ConvGRUCell(in_ch, hid_ch, kernel_size=kernel_size)
+        else:
+            # placeholder for TSM or other temporal modules
+            raise NotImplementedError("TSM mode not implemented in this wrapper yet")
+
+    def forward(self, x, h):
+        # x: (B, in_ch, H, W); h: (B, hid_ch, H, W) or None
+        return self.cell(x, h)
+# --- end add ConvGRU / TemporalUnit ---
