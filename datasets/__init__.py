@@ -36,7 +36,7 @@ def build_loader(config, mode):
         shuffle = (mode == 'train'),
         collate_fn=Dataset.collate_fn,
         persistent_workers = num_workers > 0,
-        prefetch_factor = 4 if num_workers > 0 else 2,
+        prefetch_factor = max(4, batch_size // max(num_workers, 1) * 2) if num_workers > 0 else 2,
     )
 
 def build_normal_loader(config, mode):
