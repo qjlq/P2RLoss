@@ -134,12 +134,10 @@ class NormalSample(object):
     def nearest(self, seq):
         seqlen = seq.size(0)
         if seqlen <= 1:
-            return torch.zeros(seqlen, 1) + 32
-        xx = (seq ** 2).sum(dim=-1, keepdim=True)
-        xy = seq @ seq.T
-        yy = xx.T
-        L2 = (xx - 2 * xy + yy).relu()
-        m = torch.kthvalue(L2, 2, dim=1).values
+            return torch.full((seqlen, 1), 32.0, dtype=seq.dtype, device=seq.device)
+        dist2 = torch.cdist(seq, seq).pow(2)
+        dist2.fill_diagonal_(float('inf'))
+        m = dist2.min(dim=1).values
         return m.view(-1, 1)
     
 def jpg2id(jpg):

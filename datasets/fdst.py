@@ -27,6 +27,7 @@ This implementation mirrors the sequence/flow API introduced for SHHA: returns s
 (T, C, H, W) and collate packs batches into (B, T, C, H, W). The collate_fn is compatible with train loop.
 """
 
+import functools
 import os
 import numpy as np
 import torch
@@ -94,10 +95,10 @@ class FDST(data.Dataset):
 
         self.img_dir = images_dir
         # annotation directories to try
-        self.dot_dirs = [
+        self.dot_dirs = (
             os.path.join(root_path, mode + '_data', 'new-anno'),
             os.path.join(root_path, mode + '_data', 'annotations'),
-        ]
+        )
 
         self.norm_func = NormalSample(
             mean=[0.485, 0.456, 0.406],
@@ -174,32 +175,39 @@ class FDST(data.Dataset):
         masks_seq = torch.stack(masks, dim=0)
         return imgs_seq, masks_seq
 
-    def _load_image(self, vid, frm):
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def _load_image_impl(img_dir, vid, frm):
         if vid is None:
-            imgpath = os.path.join(self.img_dir, frm + '.jpg')
+            imgpath = os.path.join(img_dir, frm + '.jpg')
         else:
-            imgpath = os.path.join(self.img_dir, vid, frm + '.jpg')
+            imgpath = os.path.join(img_dir, vid, frm + '.jpg')
         if not os.path.exists(imgpath):
-            # try png
             if vid is None:
-                imgpath = os.path.join(self.img_dir, frm + '.png')
+                imgpath = os.path.join(img_dir, frm + '.png')
             else:
-                imgpath = os.path.join(self.img_dir, vid, frm + '.png')
+                imgpath = os.path.join(img_dir, vid, frm + '.png')
             if not os.path.exists(imgpath):
                 raise FileNotFoundError(f"Image not found: {imgpath}")
         return Image.open(imgpath).convert('RGB')
 
-    def _load_annotation(self, vid, frm):
-        # try multiple patterns
+    def _load_image(self, vid, frm):
+        return self._load_image_impl(self.img_dir, vid, frm)
+
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def _load_annotation_impl(dot_dirs, vid, frm):
         candidates = []
-        for d in self.dot_dirs:
+        for d in dot_dirs:
             candidates.append(os.path.join(d, f"GT_{vid}_{frm}.npy") if vid is not None else os.path.join(d, f"GT_{frm}.npy"))
             candidates.append(os.path.join(d, vid, f"{frm}.npy") if vid is not None else os.path.join(d, f"{frm}.npy"))
         for p in candidates:
             if os.path.exists(p):
                 return torch.from_numpy(np.load(p))[:, :2]
-        # fallback: empty tensor
         return torch.zeros((0, 2), dtype=torch.float32)
+
+    def _load_annotation(self, vid, frm):
+        return self._load_annotation_impl(self.dot_dirs, vid, frm)
 
     def _read_single_label_tpl(self, tpl):
         vid, frm = tpl
@@ -236,8 +244,8 @@ class FDST(data.Dataset):
                 flows.append(None)
                 continue
             if self.flow_ext == '.npy':
-                arr = np.load(fn, mmap_mode='r')
-                flows.append(torch.from_numpy(np.asarray(arr)).float())
+                arr = np.load(fn)
+                flows.append(torch.from_numpy(arr).float())
             else:
                 obj = torch.load(fn, map_location='cpu')
                 flows.append(obj if isinstance(obj, torch.Tensor) else torch.from_numpy(np.asarray(obj)).float())
