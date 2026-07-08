@@ -195,7 +195,7 @@ def validate(config, data_loader, model, criterion):
         # handle sequences: if images shape is (B,T,C,H,W) take first frame for validation
         if images.dim() == 5:
             images = images[:, 0]  # (B,C,H,W)
-        dotseq = [d.cuda(non_blocking=True) for d in dotseq]
+        dotseq = [s[0][0].cuda(non_blocking=True) for s in dotseq]
         cnt = torch.tensor([d.size(0) for d in dotseq]).float().cuda()
         bsize = images.size(0)
         # compute output

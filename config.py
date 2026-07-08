@@ -52,7 +52,7 @@ _C.MODEL.LOSS = 'P2R'
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.START_EPOCH = 0
-_C.TRAIN.EPOCHS = 1500
+_C.TRAIN.EPOCHS = 50
 _C.TRAIN.BASE_LR = 5e-5
 _C.TRAIN.BACKBONE_LR = 1e-5
 _C.TRAIN.WEIGHT_DECAY = 1e-4
