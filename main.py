@@ -128,7 +128,8 @@ def main_worker(config):
         
         if stage == 'semi' and epoch == STAGE_1:
             teacher.load_state_dict(student.state_dict())
-            logger.info("Stage 2: teacher initialized from pre-trained student")
+            torch.cuda.empty_cache()
+            logger.info("Stage 2: teacher initialized from pre-trained student, CUDA cache cleared")
         
         temporal_train_one_epoch(
             epoch=epoch,
