@@ -40,6 +40,17 @@ class NormalSample(object):
             images, dotseqs = self.crop_and_resize(image, dotseq)
         else:
             images, dotseqs = image.unsqueeze(0), [dotseq]
+            ih, iw = images.shape[-2:]
+            if ih != self.half_h or iw != self.half_w:
+                rh, rw = self.half_h / ih, self.half_w / iw
+                images = F.interpolate(images, (self.half_h, self.half_w),
+                                       mode='bilinear', align_corners=False)
+                for j, dots in enumerate(dotseqs):
+                    if dots.size(0) > 0:
+                        scaled = dots.clone().float()
+                        scaled[:, 0] *= rw
+                        scaled[:, 1] *= rh
+                        dotseqs[j] = scaled
 
         h, w = images.shape[-2:]
         if h % 32 != 0 or w % 32 != 0:
