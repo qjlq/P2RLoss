@@ -92,6 +92,10 @@ class FDST(data.Dataset):
                 self.label.append((vid, frm))
             self.unlabel.append((vid, frm))
 
+        # O(1) lookup dictionaries replacing O(N) .index() calls
+        self.label_to_idx = {tpl: i for i, tpl in enumerate(self.label)}
+        self.unlabel_to_idx = {tpl: i for i, tpl in enumerate(self.unlabel)}
+
         self.img_dir = images_dir
         # annotation directories to try
         self.dot_dirs = (
@@ -138,10 +142,10 @@ class FDST(data.Dataset):
 
     def readLabelSequenceFromTuple(self, tpl):
         # tpl: (vid_or_none, frame_name)
-        if tpl not in self.label:
+        if tpl not in self.label_to_idx:
             # fallback: single frame read
             return self._read_single_label_tpl(tpl)
-        idx = self.label.index(tpl)
+        idx = self.label_to_idx[tpl]
         idxs = self._get_sequence_indices(self.label, idx)
         imgs = []
         dotseqs = []
@@ -157,9 +161,9 @@ class FDST(data.Dataset):
         return imgs_seq, dotseqs
 
     def readUnlabelSequenceFromTuple(self, tpl):
-        if tpl not in self.unlabel:
+        if tpl not in self.unlabel_to_idx:
             return self._read_single_unlabel_tpl(tpl)
-        idx = self.unlabel.index(tpl)
+        idx = self.unlabel_to_idx[tpl]
         idxs = self._get_sequence_indices(self.unlabel, idx)
         imgs = []
         masks = []
@@ -195,7 +199,7 @@ class FDST(data.Dataset):
             candidates.append(os.path.join(d, vid, f"{frm}.npy") if vid is not None else os.path.join(d, f"{frm}.npy"))
         for p in candidates:
             if os.path.exists(p):
-                return torch.from_numpy(np.load(p))[:, :2]
+                return torch.from_numpy(np.load(p, mmap_mode='r'))[:, :2]
         return torch.zeros((0, 2), dtype=torch.float32)
 
     def _read_single_label_tpl(self, tpl):
@@ -233,7 +237,7 @@ class FDST(data.Dataset):
                 flows.append(None)
                 continue
             if self.flow_ext == '.npy':
-                arr = np.load(fn)
+                arr = np.load(fn, mmap_mode='r')
                 flows.append(torch.from_numpy(arr).float())
             else:
                 obj = torch.load(fn, map_location='cpu')
