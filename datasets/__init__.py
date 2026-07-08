@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import torch
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 from torch.utils.data import DataLoader
 from .shha import SHHA
 from .fdst import FDST
@@ -30,7 +34,9 @@ def build_loader(config, mode):
         num_workers = num_workers,
         pin_memory=config.PIN_MEMORY,
         shuffle = (mode == 'train'),
-        collate_fn=Dataset.collate_fn
+        collate_fn=Dataset.collate_fn,
+        persistent_workers = num_workers > 0,
+        prefetch_factor = 4 if num_workers > 0 else 2,
     )
 
 def build_normal_loader(config, mode):

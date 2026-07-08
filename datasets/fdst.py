@@ -167,7 +167,6 @@ class FDST(data.Dataset):
             vid, frm = self.unlabel[ii]
             img = self._load_image(vid, frm)
             wa_img = self.norm_func.im2tensor(img)
-            sa_img = self.norm_func.strong_aug(img)
             img_proc = self.norm_func.process_unlabel(wa_img)
             imgs.append(img_proc.squeeze(0))
             masks.append(self.random_mask(img_proc).squeeze(0))

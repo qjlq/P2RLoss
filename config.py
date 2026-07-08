@@ -27,7 +27,7 @@ _C.DATA.DATASET = 'shha'
 # Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.
 _C.DATA.PIN_MEMORY = False
 # Number of data loading threads
-_C.DATA.NUM_WORKERS = 8
+_C.DATA.NUM_WORKERS = 4
 # Sequence length for temporal training
 _C.DATA.SEQ_LEN = 1
 # Stride between frames in a sequence

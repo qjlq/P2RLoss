@@ -115,7 +115,6 @@ class SHHA(data.Dataset):
             imgpath = self.imgpath.format(sid)
             img_raw = Image.open(imgpath).convert('RGB')
             wa_img = self.norm_func.im2tensor(img_raw)
-            sa_img = self.norm_func.strong_aug(img_raw)
             img_proc = self.norm_func.process_unlabel(wa_img)
             imgs.append(img_proc.squeeze(0))
             masks.append(self.random_mask(img_proc).squeeze(0))
