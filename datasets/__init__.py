@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 
 import torch
-import torch.multiprocessing
-torch.multiprocessing.set_sharing_strategy('file_system')
+import torch.multiprocessing as mp
+import resource
+# Increase file descriptor limit to avoid ancdata errors with multiprocessing
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+if rlimit[0] < 65536:
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (65536, rlimit[1]))
+    except (ValueError, resource.error):
+        pass
 
 from torch.utils.data import DataLoader
 from .shha import SHHA
