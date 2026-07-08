@@ -56,10 +56,7 @@ class NormalSample(object):
 
 
         for i, seq in enumerate(dotseqs):
-            u = self.nearest(seq)
-            dotseqs[i] = torch.cat((seq[:, [1, 0]], u), dim=1)
-        # print("L60", dotseqs[0].shape, images.shape)
-
+            dotseqs[i] = seq[:, [1, 0]]
         return images, dotseqs
     
     def process_unlabel(self, image):
@@ -131,14 +128,6 @@ class NormalSample(object):
         else:
             return crop_imgs
 
-    def nearest(self, seq):
-        seqlen = seq.size(0)
-        if seqlen <= 1:
-            return torch.full((seqlen, 1), 32.0, dtype=seq.dtype, device=seq.device)
-        dist2 = torch.cdist(seq, seq).pow(2)
-        dist2.fill_diagonal_(float('inf'))
-        m = dist2.min(dim=1).values
-        return m.view(-1, 1)
     
 def jpg2id(jpg):
     return jpg.replace('.jpg', '')

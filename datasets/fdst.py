@@ -193,14 +193,8 @@ class FDST(data.Dataset):
         return Image.open(imgpath).convert('RGB')
 
     def _load_annotation(self, vid, frm):
-        candidates = []
-        for d in self.dot_dirs:
-            candidates.append(os.path.join(d, f"GT_{vid}_{frm}.npy") if vid is not None else os.path.join(d, f"GT_{frm}.npy"))
-            candidates.append(os.path.join(d, vid, f"{frm}.npy") if vid is not None else os.path.join(d, f"{frm}.npy"))
-        for p in candidates:
-            if os.path.exists(p):
-                return torch.from_numpy(np.load(p, mmap_mode='r'))[:, :2]
-        return torch.zeros((0, 2), dtype=torch.float32)
+        p = os.path.join(self.dot_dirs[0], f"GT_{vid}_{frm}.npy" if vid is not None else f"GT_{frm}.npy")
+        return torch.from_numpy(np.load(p, mmap_mode='r').copy())[:, :2]
 
     def _read_single_label_tpl(self, tpl):
         vid, frm = tpl
@@ -225,17 +219,7 @@ class FDST(data.Dataset):
         flows = []
         for i in range(len(idxs) - 1):
             vid, frm = list_ref[idxs[i]]
-            # try multiple filename conventions
-            cand1 = os.path.join(self.flow_root, f"{vid}_{frm}_flow{self.flow_ext}") if vid is not None else os.path.join(self.flow_root, f"{frm}_flow{self.flow_ext}")
-            cand2 = os.path.join(self.flow_root, f"{frm}_flow{self.flow_ext}")
-            fn = None
-            for c in (cand1, cand2):
-                if c and os.path.exists(c):
-                    fn = c
-                    break
-            if fn is None:
-                flows.append(None)
-                continue
+            fn = os.path.join(self.flow_root, f"{vid}_{frm}_flow{self.flow_ext}" if vid is not None else f"{frm}_flow{self.flow_ext}")
             if self.flow_ext == '.npy':
                 arr = np.load(fn, mmap_mode='r')
                 flows.append(torch.from_numpy(arr).float())

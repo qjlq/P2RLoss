@@ -59,6 +59,17 @@ class P2RLoss(nn.modules.loss._Loss):
                 B_coord_batch[j, 0, :n] = s[:, :2].float()
                 point_valid[j, 0, :n] = True
 
+            # Nearest neighbor distance computed on GPU (batched cdist)
+            B_flat = B_coord_batch.view(nb, max_N, 2)
+            dist2 = torch.cdist(B_flat, B_flat).pow(2)
+            diag_mask = torch.eye(max_N, device=device).bool().unsqueeze(0)
+            dist2 = dist2.masked_fill_(diag_mask, float('inf'))
+            pad_mask = ~point_valid.view(nb, 1, max_N)
+            dist2 = dist2.masked_fill_(pad_mask.expand(-1, max_N, -1), float('inf'))
+            dist2 = dist2.masked_fill_(pad_mask.transpose(-1, -2).expand(-1, max_N, -1), float('inf'))
+            nearest_dist = dist2.min(dim=-1, keepdim=True).values  # (nb, max_N, 1)
+            nearest_dist = nearest_dist.masked_fill_(point_valid.view(nb, max_N, 1).logical_not(), 32.0)
+
             x_col = A_coord.unsqueeze(-2)
             y_row = B_coord_batch.unsqueeze(-3)
             C = torch.norm(x_col - y_row, dim=-1)
