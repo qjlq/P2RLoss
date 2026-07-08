@@ -75,6 +75,7 @@ def reduce_tensor(tensor):
 
 
 def plot_curve(label, epo, data, savepath):
+    os.makedirs(os.path.dirname(savepath), exist_ok=True)
     fig = plt.figure()
     plt.title(label)
     plt.plot(epo, data)
