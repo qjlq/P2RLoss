@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import torch
-import torch.multiprocessing as mp
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_descriptor')
+
 import resource
-# Increase file descriptor limit to avoid ancdata errors with multiprocessing
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 if rlimit[0] < 65536:
     try:
@@ -39,11 +40,11 @@ def build_loader(config, mode):
         data_set,
         batch_size = batch_size if (mode == 'train') else 1,
         num_workers = num_workers,
-        pin_memory=config.PIN_MEMORY,
+        pin_memory = True if (mode == 'train') else False,
         shuffle = (mode == 'train'),
         collate_fn=Dataset.collate_fn,
         persistent_workers = num_workers > 0,
-        prefetch_factor = max(4, batch_size // max(num_workers, 1) * 2) if num_workers > 0 else 2,
+        prefetch_factor = 4 if num_workers > 0 else 2,
     )
 
 def build_normal_loader(config, mode):

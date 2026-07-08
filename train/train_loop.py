@@ -15,6 +15,7 @@ This module provides train_one_epoch implementing the requested logic.
 """
 
 import math
+import gc
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
@@ -280,6 +281,10 @@ def train_one_epoch(
 
         epoch_loss += batch_loss
         pbar.set_postfix(loss=f'{batch_loss:.4f}')
+
+        del batch
+        if batch_idx % 4 == 0:
+            gc.collect()
 
     logger.info(f'Epoch [{epoch}] avg_loss: {epoch_loss / max(1, num_batches):.6f}')
     return
