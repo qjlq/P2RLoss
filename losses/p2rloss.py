@@ -28,7 +28,7 @@ class P2RLoss(nn.modules.loss._Loss):
         self.cost_class = 1
         self.cost_point = 8
 
-    CHUNK_SIZE = 16
+    CHUNK_SIZE = 64
 
     def _process_chunk(self, A_chunk, B_coord_chunk, point_valid_chunk, A_coord, HW, down):
         nb = B_coord_chunk.size(0)
