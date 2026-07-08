@@ -151,7 +151,7 @@ class FDST(data.Dataset):
             img_t = self.norm_func.im2tensor(img)
             dot = self._load_annotation(vid, frm)
             img_t, dot = self.norm_func.process_lable(img_t, dot)
-            imgs.append(img_t)
+            imgs.append(img_t.squeeze(0))
             dotseqs.append(dot)
         imgs_seq = torch.stack(imgs, dim=0)
         return imgs_seq, dotseqs
@@ -169,8 +169,8 @@ class FDST(data.Dataset):
             wa_img = self.norm_func.im2tensor(img)
             sa_img = self.norm_func.strong_aug(img)
             img_proc = self.norm_func.process_unlabel(wa_img)
-            imgs.append(img_proc)
-            masks.append(self.random_mask(img_proc.unsqueeze(0)).squeeze(0))
+            imgs.append(img_proc.squeeze(0))
+            masks.append(self.random_mask(img_proc).squeeze(0))
         imgs_seq = torch.stack(imgs, dim=0)
         masks_seq = torch.stack(masks, dim=0)
         return imgs_seq, masks_seq
@@ -208,15 +208,15 @@ class FDST(data.Dataset):
         img_t = self.norm_func.im2tensor(img)
         dot = self._load_annotation(vid, frm)
         img_t, dot = self.norm_func.process_lable(img_t, dot)
-        return img_t.unsqueeze(0), [dot]
+        return img_t, [dot]
 
     def _read_single_unlabel_tpl(self, tpl):
         vid, frm = tpl
         img = self._load_image(vid, frm)
         wa_img = self.norm_func.im2tensor(img)
         img_proc = self.norm_func.process_unlabel(wa_img)
-        mask = self.random_mask(img_proc.unsqueeze(0)).squeeze(0)
-        return img_proc.unsqueeze(0), mask.unsqueeze(0)
+        mask = self.random_mask(img_proc).squeeze(0)
+        return img_proc, mask
 
     def _load_flow_for_sequence(self, list_ref, start_idx):
         if not self.flow_root:

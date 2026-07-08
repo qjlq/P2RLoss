@@ -98,7 +98,7 @@ class SHHA(data.Dataset):
             img_t = self.norm_func.im2tensor(img)
             dot = torch.from_numpy(np.load(self.dotpath.format(sid)))[:, :2]
             img_t, dot = self.norm_func.process_lable(img_t, dot)
-            imgs.append(img_t)
+            imgs.append(img_t.squeeze(0))
             dotseqs.append(dot)
         imgs_seq = torch.stack(imgs, dim=0)  # (T, C, H, W)
         return imgs_seq, dotseqs
@@ -117,8 +117,8 @@ class SHHA(data.Dataset):
             wa_img = self.norm_func.im2tensor(img_raw)
             sa_img = self.norm_func.strong_aug(img_raw)
             img_proc = self.norm_func.process_unlabel(wa_img)
-            imgs.append(img_proc)
-            masks.append(self.random_mask(img_proc.unsqueeze(0)).squeeze(0))
+            imgs.append(img_proc.squeeze(0))
+            masks.append(self.random_mask(img_proc).squeeze(0))
         imgs_seq = torch.stack(imgs, dim=0)
         masks_seq = torch.stack(masks, dim=0)
         return imgs_seq, masks_seq
@@ -129,15 +129,15 @@ class SHHA(data.Dataset):
         img = self.norm_func.im2tensor(img)
         dotseq = torch.from_numpy(np.load(self.dotpath.format(smpid)))[:, :2]
         img, dotseq = self.norm_func.process_lable(img, dotseq)
-        return img.unsqueeze(0), [dotseq]
+        return img, [dotseq]
 
     def read_single_unlabel(self, smpid):
         imgpath = self.imgpath.format(smpid)
         img_raw = Image.open(imgpath).convert('RGB')
         wa_img = self.norm_func.im2tensor(img_raw)
         img = self.norm_func.process_unlabel(wa_img)
-        mask = self.random_mask(img.unsqueeze(0)).squeeze(0)
-        return img.unsqueeze(0), mask.unsqueeze(0)
+        mask = self.random_mask(img).squeeze(0)
+        return img, mask
 
     def _load_flow_for_sequence(self, ordered_list, start_idx):
         if not self.flow_root:

@@ -15,6 +15,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler
 from timm.utils import AverageMeter
 import copy
+from tqdm import tqdm
 
 from config import get_config
 from models import build_model
@@ -121,9 +122,14 @@ def main_worker(config):
     
     scaler = GradScaler()
     
-    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
+    epoch_pbar = tqdm(range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS), desc='Overall')
+    for epoch in epoch_pbar:
+        stage = 'sup' if epoch < STAGE_1 else 'semi'
         
-        # use temporal train loop with truncated BPTT, EMA, and AMP support
+        if stage == 'semi' and epoch == STAGE_1:
+            teacher.load_state_dict(student.state_dict())
+            logger.info("Stage 2: teacher initialized from pre-trained student")
+        
         temporal_train_one_epoch(
             epoch=epoch,
             dataloader=data_loader_train,
@@ -137,6 +143,7 @@ def main_worker(config):
             p2r_loss_cfg=None,
             amp_enabled=True,
             min_batch_size=2,
+            stage=stage,
         )
 
         if epoch == STAGE_2 - 1:

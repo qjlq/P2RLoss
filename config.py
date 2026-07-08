@@ -28,6 +28,14 @@ _C.DATA.DATASET = 'shha'
 _C.DATA.PIN_MEMORY = False
 # Number of data loading threads
 _C.DATA.NUM_WORKERS = 8
+# Sequence length for temporal training
+_C.DATA.SEQ_LEN = 1
+# Stride between frames in a sequence
+_C.DATA.SEQ_STRIDE = 1
+# Root directory for precomputed optical flow files
+_C.DATA.FLOW_ROOT = ''
+# File extension for flow files
+_C.DATA.FLOW_EXT = '.npy'
 
 # -----------------------------------------------------------------------------
 # Model settings

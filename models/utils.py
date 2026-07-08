@@ -93,7 +93,8 @@ class ConvGRUCell(nn.Module):
             h = torch.zeros(x.size(0), self.hid_ch, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
         cat = torch.cat([x, h], dim=1)
         zr = self.conv_zr(cat)
-        z, r = torch.sigmoid(zr.chunk(2, dim=1))
+        z_chunks = zr.chunk(2, dim=1)
+        z, r = torch.sigmoid(z_chunks[0]), torch.sigmoid(z_chunks[1])
         cat_r = torch.cat([x, r * h], dim=1)
         n = torch.tanh(self.conv_n(cat_r))
         h_next = (1 - z) * n + z * h

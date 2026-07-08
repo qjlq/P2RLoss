@@ -20,7 +20,7 @@ python preprocess/preprocess_fdst.py \
 This script is intended to be run once per dataset preparation. It handles both per-video (images/<video>/frame.jpg)
 and flat (images/frame.jpg) layouts.
 """
-
+#python preprocess/preprocess_fdst.py --root /media/SSD/OSshareSpace/localSpace/workPlace/zhongKe/gd/FDST --modes train --ext jpg
 import os
 import argparse
 import json

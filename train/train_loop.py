@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from losses.p2rloss import P2RLoss
+from tqdm import tqdm
+import logging
 
 
 def update_ema(student, teacher, alpha):
@@ -150,9 +152,14 @@ def train_one_epoch(
     p2r_loss_cfg=None,
     amp_enabled=True,
     min_batch_size=2,
+    stage='sup',
 ):
     """
     Core training loop implementing truncated BPTT and temporal P2R calibration.
+    
+    stage='sup': supervised training on labeled data only.
+    stage='semi': semi-supervised with supervised loss + temporal pseudo-labeling.
+    
     - dataloader yields tuples depending on Dataset.collate_fn. Expected training batch:
       (limg_batch [B,T,C,H,W], lseqs_list, lids, uimg_batch [B,T,C,H,W], umask_batch [B,T,1,H,W], uids, uflows_batch or None)
     - student/teacher forward: (pred_logits, next_h) = model(frame, prev_h)
@@ -165,9 +172,13 @@ def train_one_epoch(
     if scaler is None:
         scaler = GradScaler()
 
-    for batch_idx, batch in enumerate(dataloader):
+    logger = logging.getLogger('VGG16BN')
+    num_batches = len(dataloader)
+    pbar = tqdm(dataloader, desc=f'Epoch [{epoch}]', leave=False)
+    
+    epoch_loss = 0.0
+    for batch_idx, batch in enumerate(pbar):
         # Unpack batch; support older dataset formats by trying variants
-        # Prefer unlabeled forms
         if len(batch) >= 7:
             limg_batch, lseqs, lids, uimg_batch, umask_batch, uids, uflows_batch = batch
         elif len(batch) == 3:
@@ -176,7 +187,6 @@ def train_one_epoch(
             umask_batch = None
             uflows_batch = None
         else:
-            # fallback
             raise RuntimeError("Unsupported batch format from dataloader")
 
         # Move to device
@@ -187,86 +197,89 @@ def train_one_epoch(
         if umask_batch is not None:
             umask_batch = umask_batch.to(device)
         if uflows_batch is not None:
-            # flows shape expected (B, T-1, 2, H, W)
             uflows_batch = uflows_batch.to(device)
 
         B, T, C, H, W = uimg_batch.shape
-        check_min_batch(uimg_batch, min_bs=min_batch_size)
 
-        # initialize hidden states for student and teacher
-        student_h = student.init_hidden(B, device=device, spatial_size=(H // down, W // down))
-        teacher_h = teacher.init_hidden(B, device=device, spatial_size=(H // down, W // down))
-
-        # Precompute teacher forward on t=0 to obtain teacher prediction for t=0
-        with torch.no_grad():
-            frame0 = uimg_batch[:, 0]
+        # === Supervised loss on labeled first frame ===
+        sup_loss = 0.0
+        if limg_batch is not None and limg_batch.size(0) > 0:
+            lframe = limg_batch[:, 0]
             with autocast(enabled=amp_enabled):
-                teacher_pred0, teacher_h = teacher(frame0, teacher_h)
-            # teacher_pred0: (B,1,H_out,W_out)
-            teacher_pred_prev = teacher_pred0.detach()
+                lpred, _ = student(lframe, prev_h=None)
+            ldots = [seq[0][0][:, :2].to(device) for seq in lseqs]
+            sup_loss = p2r(lpred, ldots, down=down)
 
-        # iterate time steps t = 1 .. T-1
-        for t in range(1, T):
+        if stage == 'sup':
+            # Supervised only: backward on supervised loss
             optimizer.zero_grad()
-            frame_t = uimg_batch[:, t]
-            flow_t_minus = None
-            if uflows_batch is not None:
-                # flows for pair (t-1 -> t) at index t-1
-                flow_t_minus = uflows_batch[:, t - 1]  # (B,2,Hf,Wf) ; Hf,Wf should match decoded output spatial resolution or input resolution
-                # If flow is provided at input resolution and p2r expects coords in original, this is fine.
-
-            # Student forward for frame t
-            with autocast(enabled=amp_enabled):
-                student_pred_t, student_h = student(frame_t, student_h)
-
-            # Generate teacher pseudo-points from teacher_pred_prev (which corresponds to t-1)
-            with torch.no_grad():
-                points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=0.3)
-                # If flow is available, warp these points to frame t
-                if flow_t_minus is not None:
-                    # flow_t_minus currently shape (B,2,Hf,Wf) where Hf,Wf may equal student_pred_t spatial size
-                    warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus)
-                else:
-                    warped_points_list = points_prev_list
-
-            # compute temporal P2R loss between student_pred_t and warped teacher pseudo points
-            seqs_for_loss = prepare_p2r_seqs_from_points_list(warped_points_list)
-            # p2r expects dens as list-per-batch? In original implementation forward(dens, seqs, down...)
-            # dens should be list or tensor with batch dimension already. p2r.forward uses dens[i] indexing assuming dens is batch list or tensor
-            # Make sure student_pred_t is in CPU/float as required by P2R. We'll pass student_pred_t (B,1,Hout,Wout)
-            with autocast(enabled=amp_enabled):
-                loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down, masks=None)
-
-            # If labeled frames available for same t, compute supervised P2R with ground truth points
-            sup_loss = 0.0
-            if limg_batch is not None and limg_batch.shape[1] > t:
-                # try to match labeled sequence t index; this depends on dataset pairing. We conservatively skip here unless labels aligned
-                pass
-
-            loss = loss_p2r
-
-            # Backprop with AMP and truncated BPTT step
             if amp_enabled:
-                scaler.scale(loss).backward()
+                scaler.scale(sup_loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
+                sup_loss.backward()
                 optimizer.step()
+            batch_loss = sup_loss.item()
 
-            # After optimizer step, detach student hidden to truncate BPTT
-            student_h = student_h.detach()
+        elif stage == 'semi':
+            # Semi-supervised: supervised + temporal pseudo-labeling
+            check_min_batch(uimg_batch, min_bs=min_batch_size)
 
-            # Update teacher weights via EMA (no gradient)
-            update_ema(student, teacher, ema_alpha)
+            student_h = student.init_hidden(B, device=device, spatial_size=(H // down, W // down))
+            teacher_h = teacher.init_hidden(B, device=device, spatial_size=(H // down, W // down))
 
-            # Advance teacher forward to produce prediction for current t (to be used in next step)
             with torch.no_grad():
-                teacher_pred_t, teacher_h = teacher(frame_t, teacher_h)
-                teacher_pred_prev = teacher_pred_t.detach()
+                frame0 = uimg_batch[:, 0]
+                with autocast(enabled=amp_enabled):
+                    teacher_pred0, teacher_h = teacher(frame0, teacher_h)
+                teacher_pred_prev = teacher_pred0.detach()
 
-        # end time loop
+            batch_loss = 0.0
+            for t in range(1, T):
+                optimizer.zero_grad()
+                frame_t = uimg_batch[:, t]
+                flow_t_minus = None
+                if uflows_batch is not None:
+                    flow_t_minus = uflows_batch[:, t - 1]
 
-    # end batch loop
+                with autocast(enabled=amp_enabled):
+                    student_pred_t, student_h = student(frame_t, student_h)
 
+                with torch.no_grad():
+                    points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=0.3)
+                    if flow_t_minus is not None:
+                        warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus)
+                    else:
+                        warped_points_list = points_prev_list
+
+                seqs_for_loss = prepare_p2r_seqs_from_points_list(warped_points_list)
+                with autocast(enabled=amp_enabled):
+                    loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down, masks=None)
+
+                loss = loss_p2r + sup_loss / (T - 1)
+                batch_loss += loss.item()
+
+                if amp_enabled:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+
+                student_h = student_h.detach()
+                update_ema(student, teacher, ema_alpha)
+
+                with torch.no_grad():
+                    teacher_pred_t, teacher_h = teacher(frame_t, teacher_h)
+                    teacher_pred_prev = teacher_pred_t.detach()
+
+        else:
+            raise ValueError(f"Unknown stage: {stage}")
+
+        epoch_loss += batch_loss
+        pbar.set_postfix(loss=f'{batch_loss:.4f}')
+
+    logger.info(f'Epoch [{epoch}] avg_loss: {epoch_loss / max(1, num_batches):.6f}')
     return
