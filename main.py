@@ -106,10 +106,13 @@ def main_worker(config):
     if config.MODEL.RESUME:
         saved_epoch, max_accuracy = load_checkpoint(
             config, [teacher, student], optimizer, lr_scheduler, scaler, logger)
-        config.defrost()
-        config.TRAIN.START_EPOCH = saved_epoch + 1
-        config.freeze()
-        logger.info(f'Resuming from epoch {saved_epoch}, continuing at epoch {config.TRAIN.START_EPOCH}')
+        if saved_epoch >= 0:
+            config.defrost()
+            config.TRAIN.START_EPOCH = saved_epoch + 1
+            config.freeze()
+            logger.info(f'Resuming from epoch {saved_epoch}, continuing at epoch {config.TRAIN.START_EPOCH}')
+        else:
+            logger.info(f'Checkpoint has no epoch info, keeping START_EPOCH={config.TRAIN.START_EPOCH}')
         if config.EVAL_MODE:
             return
 

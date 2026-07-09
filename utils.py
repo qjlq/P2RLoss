@@ -35,7 +35,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, scaler, logger):
     if scaler is not None and 'scaler' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler'])
         logger.info("[load scaler]: OK")
-    saved_epoch = checkpoint.get('epoch', 0)
+    saved_epoch = checkpoint.get('epoch', -1)
     max_accuracy = checkpoint.get('max_accuracy', [1e6] * 3)
     return saved_epoch, max_accuracy
 
