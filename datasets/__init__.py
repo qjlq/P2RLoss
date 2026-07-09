@@ -18,7 +18,7 @@ from .fdst import FDST
 
 def build_loader(config, mode):
     data_path = config.DATA_PATH
-    label_prob = config.LABEL_PERCENT
+    label_prob = getattr(config, 'LABEL_PERCENT', 1.0)
     protc_path = getattr(config, 'LABEL_PROTOCOL', '')
     batch_size = config.BATCH_SIZE
     num_workers = config.NUM_WORKERS
