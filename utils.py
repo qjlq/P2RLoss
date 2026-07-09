@@ -6,7 +6,6 @@
 # --------------------------------------------------------
 
 import os
-import re
 import torch
 import torch.distributed as dist
 import matplotlib
@@ -36,19 +35,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, scaler, logger):
     if scaler is not None and 'scaler' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler'])
         logger.info("[load scaler]: OK")
-    saved_epoch = checkpoint.get('epoch', None)
-    if saved_epoch is None:
-        fname = os.path.basename(config.MODEL.RESUME)
-        m = re.search(r'epoch_?(\d+)', fname)
-        if m:
-            saved_epoch = int(m.group(1))
-        elif 'stage2' in fname:
-            saved_epoch = 49
-        elif 'best' in fname:
-            saved_epoch = 0
-        else:
-            saved_epoch = 0
-        logger.warning(f"checkpoint missing 'epoch' key, inferred epoch={saved_epoch} from filename")
+    saved_epoch = checkpoint.get('epoch', 0)
     max_accuracy = checkpoint.get('max_accuracy', [1e6] * 3)
     return saved_epoch, max_accuracy
 
