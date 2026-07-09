@@ -18,7 +18,7 @@ class L2DIS:
 
 
 class P2RLoss(nn.modules.loss._Loss):
-    def __init__(self, factor=1, reduction='mean') -> None:
+    def __init__(self, factor=1, reduction='mean', pos_weight=20.0) -> None:
         super().__init__()
         self.factor = factor
         self.cost = L2DIS(1)
@@ -27,6 +27,9 @@ class P2RLoss(nn.modules.loss._Loss):
 
         self.cost_class = 1
         self.cost_point = 8
+
+        # Key fix for class imbalance
+        self.pos_weight = float(pos_weight)
 
     CHUNK_SIZE = 64
 
@@ -43,7 +46,9 @@ class P2RLoss(nn.modules.loss._Loss):
         dist2 = dist2.masked_fill_(pad_mask.expand(-1, max_N, -1), float('inf'))
         dist2 = dist2.masked_fill_(pad_mask.transpose(-1, -2).expand(-1, max_N, -1), float('inf'))
         nearest_dist = dist2.min(dim=-1, keepdim=True).values
-        nearest_dist = nearest_dist.masked_fill_(point_valid_chunk.view(nb, max_N, 1).logical_not(), 32.0)
+        nearest_dist = nearest_dist.masked_fill_(
+            point_valid_chunk.view(nb, max_N, 1).logical_not(), 32.0
+        )
 
         x_col = A_coord.unsqueeze(-2)
         y_row = B_coord_chunk.unsqueeze(-3)
@@ -67,7 +72,12 @@ class P2RLoss(nn.modules.loss._Loss):
             minC2, mcidx2 = C2.min(dim=2, keepdim=True)
             T_chunk = torch.zeros_like(C2).scatter_(2, mcidx2, 1.0).sum(dim=-1)
             T_chunk = (T_chunk > 0.5).float()
-            W_chunk = T_chunk + 1.0
+
+            # IMPORTANT FIX: stronger positive weighting
+            # old: W_chunk = T_chunk + 1.0   (pos=2, neg=1)
+            # new: pos gets much larger weight, e.g. 20x
+            W_chunk = torch.ones_like(T_chunk)
+            W_chunk = W_chunk + T_chunk * (self.pos_weight - 1.0)  # neg=1, pos=pos_weight
 
         return T_chunk.view(nb, HW), W_chunk.view(nb, HW)
 
@@ -83,19 +93,19 @@ class P2RLoss(nn.modules.loss._Loss):
         A_coord = torch.stack(torch.meshgrid(
             torch.arange(H, device=device),
             torch.arange(W, device=device),
-            indexing='ij'), dim=-1).float().view(1, 1, HW, 2) * down + (down - 1) / 2
+            indexing='ij'
+        ), dim=-1).float().view(1, 1, HW, 2) * down + (down - 1) / 2
+
         A = dens.view(bs, HW)
 
         T_full = torch.zeros(bs, HW, device=device)
-        W_full = torch.ones(bs, HW, device=device) * 0.5
+        W_full = torch.ones(bs, HW, device=device)
 
         nonempty_idx = [i for i in range(bs) if seqs[i].size(0) >= 1]
         if nonempty_idx:
             nb = len(nonempty_idx)
             seqs_list = [seqs[i] for i in nonempty_idx]
-            max_N = max(s.size(0) for s in seqs_list)
 
-            # Process in chunks to limit GPU memory (C, M, C2 scale as nb*HW*max_N)
             for chunk_start in range(0, nb, self.CHUNK_SIZE):
                 chunk_end = min(chunk_start + self.CHUNK_SIZE, nb)
                 chunk_idx = nonempty_idx[chunk_start:chunk_end]
@@ -111,12 +121,13 @@ class P2RLoss(nn.modules.loss._Loss):
                     point_valid_chunk[j, 0, :n] = True
 
                 T_chunk, W_chunk = self._process_chunk(
-                    A[chunk_idx], B_coord_chunk, point_valid_chunk,
-                    A_coord, HW, down)
-
+                    A[chunk_idx], B_coord_chunk, point_valid_chunk, A_coord, HW, down
+                )
                 T_full[chunk_idx] = T_chunk
                 W_full[chunk_idx] = W_chunk
 
-        loss = tF.binary_cross_entropy_with_logits(A, T_full, weight=W_full, reduction='mean')
+        # weighted BCEWithLogits
+        loss = tF.binary_cross_entropy_with_logits(
+            A, T_full, weight=W_full, reduction='mean'
+        )
         return loss
-    

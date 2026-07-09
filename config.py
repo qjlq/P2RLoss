@@ -7,6 +7,7 @@
 
 import os
 import yaml
+import datetime
 from yacs.config import CfgNode as CN
 
 _C = CN()
@@ -146,7 +147,10 @@ def update_config(config, args):
     if args.throughput:
         config.THROUGHPUT_MODE = True
 
-    # output folder
+    # output folder — append timestamp unless resuming
+    if not config.MODEL.RESUME and not config.EVAL_MODE:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        config.TAG = f"{config.TAG}_{ts}"
     config.OUTPUT = os.path.join('exp', config.TAG, 'output')
 
     config.freeze()
