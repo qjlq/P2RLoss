@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 
-def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
+def load_checkpoint(config, model, optimizer, lr_scheduler, scaler, logger):
     logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
     if config.MODEL.RESUME.startswith('https'):
         checkpoint = torch.hub.load_state_dict_from_url(
@@ -26,15 +26,30 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
     logger.info(f"[load teacher]: {msg_t}")
     msg_s = student.load_state_dict(checkpoint['student'], strict=False)
     logger.info(f"[load student]: {msg_s}")
-    max_accuracy = [1e6] * 3
-    return max_accuracy
+    if optimizer is not None and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        logger.info("[load optimizer]: OK")
+    if lr_scheduler is not None and 'lr_scheduler' in checkpoint:
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        logger.info("[load lr_scheduler]: OK")
+    if scaler is not None and 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+        logger.info("[load scaler]: OK")
+    saved_epoch = checkpoint.get('epoch', 0)
+    max_accuracy = checkpoint.get('max_accuracy', [1e6] * 3)
+    return saved_epoch, max_accuracy
 
-def save_checkpoint(config, epoch, model, max_accuracy, logger):
+def save_checkpoint(config, epoch, model, optimizer, lr_scheduler, scaler, max_accuracy, logger):
     teacher, student = model
-    save_state = {'teacher': teacher.state_dict(),
-                  'student': student.state_dict(),
-                  'max_accuracy': max_accuracy
-                }
+    save_state = {
+        'teacher': teacher.state_dict(),
+        'student': student.state_dict(),
+        'epoch': epoch,
+        'optimizer': optimizer.state_dict() if optimizer else None,
+        'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None,
+        'scaler': scaler.state_dict() if scaler else None,
+        'max_accuracy': max_accuracy,
+    }
     save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
     logger.info(f"{save_path} saving......")
     torch.save(save_state, save_path)

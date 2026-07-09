@@ -104,32 +104,37 @@ def main_worker(config):
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
     if config.MODEL.RESUME:
-        max_accuracy = load_checkpoint(config, [teacher, student], optimizer, lr_scheduler, logger)
-        # mae, mse, loss = validate(config, data_loader_val, student, test_criterion)
-        # max_accuracy = (mae, mse, loss)
-        # logger.info(f"Accuracy of the network on the test images: {mae:.2f} | {mse:.2f}")
+        saved_epoch, max_accuracy = load_checkpoint(
+            config, [teacher, student], optimizer, lr_scheduler, scaler, logger)
+        config.defrost()
+        config.TRAIN.START_EPOCH = saved_epoch + 1
+        config.freeze()
+        logger.info(f'Resuming from epoch {saved_epoch}, continuing at epoch {config.TRAIN.START_EPOCH}')
         if config.EVAL_MODE:
             return
 
     global STAGE_1, STAGE_2
-    # STAGE_1 = max(25, int(5 / config.DATA.LABEL_PERCENT))
-    STAGE_1 = 25 # config.TRAIN.EPOCHS
+    STAGE_1 = 25
     STAGE_2 = STAGE_1 * 2
 
-    logger.info(f"Start training: [STAGE_1: {STAGE_1}] [STAGE_2: {STAGE_2}]")
+    logger.info(f"Start training: [STAGE_1: {STAGE_1}] [STAGE_2: {STAGE_2}] "
+                f"START_EPOCH={config.TRAIN.START_EPOCH} TOTAL_EPOCHS={config.TRAIN.EPOCHS}")
     start_time = time.time()
     epostack, maestack, msestack, lossstack = [], [], [], []
     
     scaler = GradScaler()
+    resumed = config.TRAIN.START_EPOCH > 0
     
     epoch_pbar = tqdm(range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS), desc='Overall')
     for epoch in epoch_pbar:
-        stage = 'sup' if epoch < STAGE_1 else 'semi'
-        
-        if stage == 'semi' and epoch == STAGE_1:
-            teacher.load_state_dict(student.state_dict())
-            torch.cuda.empty_cache()
-            logger.info("Stage 2: teacher initialized from pre-trained student, CUDA cache cleared")
+        if epoch < STAGE_1:
+            stage = 'sup'
+        elif epoch >= STAGE_1:
+            stage = 'semi'
+            if epoch == STAGE_1 and not resumed:
+                teacher.load_state_dict(student.state_dict())
+                torch.cuda.empty_cache()
+                logger.info("Stage 2: teacher initialized from pre-trained student, CUDA cache cleared")
         
         temporal_train_one_epoch(
             epoch=epoch,
@@ -148,10 +153,8 @@ def main_worker(config):
         )
 
         if epoch == STAGE_2 - 1:
-            save_checkpoint(config, "stage2", [teacher, student], max_accuracy, logger)
+            save_checkpoint(config, epoch, [teacher, student], optimizer, lr_scheduler, scaler, max_accuracy, logger)
 
-        # if lr_scheduler is not None: lr_scheduler.step()
-        
         if epoch > 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             mae, mse, loss = validate(config, data_loader_val, student, test_criterion)
             epostack.append(epoch)
@@ -165,7 +168,9 @@ def main_worker(config):
             logger.info(f"Accuracy of the network on the test images: {loss:.6f}")
 
             if mae * 4 + mse < max_accuracy[0] * 4 + max_accuracy[1]:
-                save_checkpoint(config, "best", [teacher, student], max_accuracy, logger)
+                save_checkpoint(
+                    config, f"best_epoch{epoch}", [teacher, student],
+                    optimizer, lr_scheduler, scaler, max_accuracy, logger)
                 max_accuracy = (mae, mse, loss)
             logger.info(f'Min total MAE|MSE|Loss: {max_accuracy[0]:.6f} | {max_accuracy[1]:.2f} | {max_accuracy[2] * 1e5:.2f}')
 
