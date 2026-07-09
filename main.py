@@ -89,7 +89,7 @@ def main_worker(config):
 
     lr_scheduler = StepLR(optimizer, step_size=config.TRAIN.LR_SCHEDULER.DECAY_EPOCHS, gamma=config.TRAIN.LR_SCHEDULER.DECAY_RATE)
 
-    max_accuracy = [1e6] * 3
+    scaler = GradScaler()
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -122,7 +122,6 @@ def main_worker(config):
     start_time = time.time()
     epostack, maestack, msestack, lossstack = [], [], [], []
     
-    scaler = GradScaler()
     resumed = config.TRAIN.START_EPOCH > 0
     
     epoch_pbar = tqdm(range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS), desc='Overall')
