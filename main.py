@@ -22,7 +22,7 @@ from models import build_model
 from datasets import build_loader
 from losses import build_loss
 from logger import create_logger
-from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor, plot_curve, set_seed
+from p2r_utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor, plot_curve, set_seed
 from train.train_loop import train_one_epoch as temporal_train_one_epoch
 
 STAGE_1, STAGE_2 = 0, 1
@@ -73,16 +73,23 @@ def main_worker(config):
     criterion, test_criterion = build_loss(config.MODEL)
     criterion.cuda(); test_criterion.cuda()
 
+    model_name = config.MODEL.NAME.lower()
+
     param_dicts = [
         {
-            "params": [p for n, p in student.named_parameters() if "encoders" not in n and p.requires_grad]
+            "params": [p for n, p in student.named_parameters()
+                       if "encoders" not in n and p.requires_grad]
         }, {
-            "params": [p for n, p in student.named_parameters() if "encoders" in n and p.requires_grad],
+            "params": [p for n, p in student.named_parameters()
+                       if "encoders" in n and p.requires_grad],
             "lr": config.TRAIN.BACKBONE_LR,
         },
+    ] if model_name == 'vgg16bn' else [
+        {"params": [p for p in student.parameters() if p.requires_grad]},
     ]
 
     optimizer = optim.Adam(param_dicts, lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY)
+    accumulation_steps = 2 if model_name == 'emac' else 1
     
 
     n_parameters = sum(p.numel() for p in student.parameters() if p.requires_grad)
@@ -157,13 +164,15 @@ def main_worker(config):
             stage=stage,
             stage1_epochs=STAGE_1,
             total_epochs=config.TRAIN.EPOCHS,
+            model_name=model_name,
+            accumulation_steps=accumulation_steps,
         )
 
         if epoch == STAGE_2 - 1:
             save_checkpoint(config, epoch, [teacher, student], optimizer, lr_scheduler, scaler, max_accuracy, logger)
 
         if epoch > 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            mae, mse, loss = validate(config, data_loader_val, student, test_criterion)
+            mae, mse, loss = validate(config, data_loader_val, student, test_criterion, model_name=model_name)
             epostack.append(epoch)
             maestack.append(mae)
             msestack.append(mse)
@@ -187,11 +196,11 @@ def main_worker(config):
 
 
 @torch.no_grad()
-def validate(config, data_loader, model, criterion, peak_thresh=0.50, nms_kernel=3):
+def validate(config, data_loader, model, criterion, peak_thresh=0.50, nms_kernel=3, model_name='vgg16bn'):
     """
     Temporal validation:
       - keep full sequence (B,T,C,H,W)
-      - propagate hidden state prev_h across time
+      - propagate hidden state prev_h across time (VGG16BN) or use 2-frame sliding window (EMAC)
       - count via local maxima on sigmoid(logits), not by (logit > 0) pixel area
     """
     model.eval()
@@ -212,12 +221,10 @@ def validate(config, data_loader, model, criterion, peak_thresh=0.50, nms_kernel
 
         images = images.cuda(non_blocking=True)
 
-        # Build GT count from first supervised frame labels (same convention as your current code)
-        # dotseq entry expected per-sample; robustly handle nested list/tuple
+        # Build GT count from first supervised frame labels
         gt_counts = []
         for s in dotseq:
             if isinstance(s, (list, tuple)):
-                # e.g. s[0][0] in your original; keep robust fallback
                 if len(s) > 0 and isinstance(s[0], (list, tuple)):
                     cur = s[0][0]
                 elif len(s) > 0:
@@ -236,24 +243,30 @@ def validate(config, data_loader, model, criterion, peak_thresh=0.50, nms_kernel
             images = images.unsqueeze(1)  # (B,1,C,H,W)
 
         B, T, C, H, W = images.shape
-        prev_h = None
         last_logits = None
         seq_loss = 0.0
 
-        # Temporal forward across all frames
-        for t in range(T):
-            frame = images[:, t]  # (B,C,H,W)
-            if hasattr(model, 'init_hidden'):
-                logits_t, prev_h = model(frame, prev_h=prev_h)
-            else:
-                logits_t = model(frame)
-            last_logits = logits_t
-
-            # Optional: average frame losses against same GT supervision proxy
-            # (keeps validation loss numerically stable for temporal models)
-            seq_loss += criterion(logits_t, gt_counts, frame.size(-1) // logits_t.size(-1)).item()
-
-        loss = seq_loss / max(T, 1)
+        if model_name == 'emac':
+            # EMAC: 2-frame sliding window; predict for each frame using next as template
+            for t in range(T - 1):
+                cur = images[:, t]
+                nxt = images[:, t + 1]
+                logits_t = model(cur, templates=[nxt])
+                last_logits = logits_t
+                seq_loss += criterion(logits_t, gt_counts, cur.size(-1) // logits_t.size(-1)).item()
+            loss = seq_loss / max(T - 1, 1)
+        else:
+            # VGG16BN: propagate hidden state across time
+            prev_h = None
+            for t in range(T):
+                frame = images[:, t]
+                if hasattr(model, 'init_hidden'):
+                    logits_t, prev_h = model(frame, prev_h=prev_h)
+                else:
+                    logits_t = model(frame)
+                last_logits = logits_t
+                seq_loss += criterion(logits_t, gt_counts, frame.size(-1) // logits_t.size(-1)).item()
+            loss = seq_loss / max(T, 1)
 
         # ---- Peak-based counting (NMS via max-pool on probability map) ----
         prob = torch.sigmoid(last_logits)  # (B,1,h,w) or (B,C,h,w)
