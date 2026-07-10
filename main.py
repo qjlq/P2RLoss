@@ -51,6 +51,7 @@ def get_args_parser():
     parser.add_argument('--tag', help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
+    parser.add_argument('--sup-only', action='store_true', help='supervised only, skip semi stage')
 
     args, unparsed = parser.parse_known_args()
 
@@ -119,7 +120,7 @@ def main_worker(config):
             return
 
     global STAGE_1, STAGE_2
-    STAGE_1 = 25
+    STAGE_1 = config.TRAIN.EPOCHS if config.TRAIN.SUP_ONLY else 25
     STAGE_2 = STAGE_1 * 2
 
     logger.info(f"Start training: [STAGE_1: {STAGE_1}] [STAGE_2: {STAGE_2}] "
@@ -154,6 +155,8 @@ def main_worker(config):
             amp_enabled=True,
             min_batch_size=2,
             stage=stage,
+            stage1_epochs=STAGE_1,
+            total_epochs=config.TRAIN.EPOCHS,
         )
 
         if epoch == STAGE_2 - 1:
@@ -172,10 +175,10 @@ def main_worker(config):
             logger.info(f"Accuracy of the network on the test images: {loss:.6f}")
 
             if mae * 4 + mse < max_accuracy[0] * 4 + max_accuracy[1]:
+                max_accuracy = (mae, mse, loss)
                 save_checkpoint(
                     config, f"best_epoch{epoch}", [teacher, student],
                     optimizer, lr_scheduler, scaler, max_accuracy, logger)
-                max_accuracy = (mae, mse, loss)
             logger.info(f'Min total MAE|MSE|Loss: {max_accuracy[0]:.6f} | {max_accuracy[1]:.2f} | {max_accuracy[2] * 1e5:.2f}')
 
     total_time = time.time() - start_time
@@ -289,62 +292,7 @@ def validate(config, data_loader, model, criterion, peak_thresh=0.50, nms_kernel
 
     logger.info(f' * MAE {mae_meter.avg:.3f} MSE {mse_meter.avg ** 0.5:.3f}')
     return mae_meter.avg, mse_meter.avg ** 0.5, loss_meter.avg
-    model.eval()
-
-    batch_time = AverageMeter()
-    loss_meter = AverageMeter()
-
-    mae_meter = AverageMeter()
-    mse_meter = AverageMeter()
-
-    end = time.time()
-    for idx, batch in enumerate(data_loader):
-        # handle both old (3 items) and new sequence format (4 items with optional flows)
-        if len(batch) == 3:
-            images, dotseq, imgid = batch
-        else:
-            images, dotseq, imgid = batch[0], batch[1], batch[2]
-        
-        images = images.cuda(non_blocking=True)
-        # handle sequences: if images shape is (B,T,C,H,W) take first frame for validation
-        if images.dim() == 5:
-            images = images[:, 0]  # (B,C,H,W)
-        dotseq = [s[0][0].cuda(non_blocking=True) for s in dotseq]
-        cnt = torch.tensor([d.size(0) for d in dotseq]).float().cuda()
-        bsize = images.size(0)
-        # compute output
-        with torch.no_grad():
-            # handle temporal model: call forward with prev_h=None
-            if hasattr(model, 'init_hidden'):
-                output, _ = model(images, prev_h=None)
-            else:
-                output = model(images)
-            # outnum = output.sum(dim=(1,2,3)) / config.MODEL.FACTOR
-            loss = criterion(output, dotseq, images.size(-1) // output.size(-1)).item()
-            outnum = (output > 0).sum(dim=(1, 2, 3))
-        diff = torch.abs(outnum - cnt)
-        mae, mse = diff.mean(), (diff ** 2).mean()
-
-        loss_meter.update(loss, bsize)
-        mae_meter.update(mae.item(), bsize)
-        mse_meter.update(mse.item(), bsize)
-
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if idx % config.PRINT_FREQ == 0:
-            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-            logger.info(
-                f'Test: [{idx}/{len(data_loader)}]  '
-                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                f'Loss {loss_meter.val:.6f} ({loss_meter.avg:.6f})  '
-                f'MAE {mae_meter.val:.3f} ({mae_meter.avg:.3f})  '
-                f'MSE {mse_meter.val ** 0.5:.3f} ({mse_meter.avg ** 0.5:.3f})  '
-                f'Mem {memory_used:.0f}MB')
-    logger.info(f' * MAE {mae_meter.avg:.3f} MSE {mse_meter.avg ** 0.5:.3f}')
-    return mae_meter.avg, mse_meter.avg ** 0.5, loss_meter.avg
+    
 
 if __name__ == '__main__':
     # torch.cuda.set_per_process_memory_fraction(0.5, 0)

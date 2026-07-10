@@ -33,7 +33,7 @@ class P2RLoss(nn.modules.loss._Loss):
 
     CHUNK_SIZE = 64
 
-    def _process_chunk(self, A_chunk, B_coord_chunk, point_valid_chunk, A_coord, HW, down):
+    def _process_chunk(self, A_chunk, B_coord_chunk, point_valid_chunk, A_coord, HW, down, pos_weight=None):
         nb = B_coord_chunk.size(0)
         max_N = B_coord_chunk.size(2)
         device = A_chunk.device
@@ -76,12 +76,13 @@ class P2RLoss(nn.modules.loss._Loss):
             # IMPORTANT FIX: stronger positive weighting
             # old: W_chunk = T_chunk + 1.0   (pos=2, neg=1)
             # new: pos gets much larger weight, e.g. 20x
+            pw = pos_weight if pos_weight is not None else self.pos_weight
             W_chunk = torch.ones_like(T_chunk)
-            W_chunk = W_chunk + T_chunk * (self.pos_weight - 1.0)  # neg=1, pos=pos_weight
+            W_chunk = W_chunk + T_chunk * (pw - 1.0)  # neg=1, pos=pw
 
         return T_chunk.view(nb, HW), W_chunk.view(nb, HW)
 
-    def forward(self, dens, seqs, down, masks=None, crop_den_masks=None):
+    def forward(self, dens, seqs, down, masks=None, crop_den_masks=None, pos_weight=None):
         bs = len(seqs)
         if bs == 0:
             return torch.tensor(0.0, device=dens.device)
@@ -91,9 +92,9 @@ class P2RLoss(nn.modules.loss._Loss):
         HW = H * W
 
         A_coord = torch.stack(torch.meshgrid(
-            torch.arange(H, device=device),
             torch.arange(W, device=device),
-            indexing='ij'
+            torch.arange(H, device=device),
+            indexing='xy'
         ), dim=-1).float().view(1, 1, HW, 2) * down + (down - 1) / 2
 
         A = dens.view(bs, HW)
@@ -121,7 +122,7 @@ class P2RLoss(nn.modules.loss._Loss):
                     point_valid_chunk[j, 0, :n] = True
 
                 T_chunk, W_chunk = self._process_chunk(
-                    A[chunk_idx], B_coord_chunk, point_valid_chunk, A_coord, HW, down
+                    A[chunk_idx], B_coord_chunk, point_valid_chunk, A_coord, HW, down, pos_weight
                 )
                 T_full[chunk_idx] = T_chunk
                 W_full[chunk_idx] = W_chunk

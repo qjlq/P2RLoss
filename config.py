@@ -64,12 +64,13 @@ _C.TRAIN.AUTO_RESUME = True
 # Gradient accumulation steps
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
+_C.TRAIN.SUP_ONLY = False
 
 # LR scheduler
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'step'
 # Epoch interval to decay LR, used in StepLRScheduler
-_C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 3500
+_C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 20
 # LR decay rate, used in StepLRScheduler
 _C.TRAIN.LR_SCHEDULER.DECAY_RATE = 0.900
 
@@ -146,6 +147,8 @@ def update_config(config, args):
         config.EVAL_MODE = True
     if args.throughput:
         config.THROUGHPUT_MODE = True
+    if args.sup_only:
+        config.TRAIN.SUP_ONLY = True
 
     # output folder — append timestamp unless resuming
     if not config.MODEL.RESUME and not config.EVAL_MODE:

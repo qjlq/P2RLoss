@@ -58,69 +58,73 @@ def generate_points_from_density(density_logits, threshold=0.3, topk=None):
     return points_list
 
 
-def sample_flow_at_points(flow, points):
+def sample_flow_at_points(flow, points, flow_down=2, model_down=4):
     """
     Sample per-point flow vectors from a dense flow map using grid_sample.
     Args:
         flow: Tensor (B, 2, H, W)
-        points: Tensor (B, N, 2) in (x, y) pixel coordinates (0..W-1, 0..H-1). If N==0 returns empty tensor.
+        points: Tensor (B, N, 2) in (x, y) pixel coordinates at model density-map resolution.
+                If N==0 returns empty tensor.
+        flow_down: downsampling factor used when computing flow (e.g. 2)
+        model_down: downsampling factor of the model's density map (e.g. 4)
     Returns:
-        sampled: Tensor (B, N, 2) flow vectors (dx, dy) in pixels
+        sampled: Tensor (B, N, 2) flow vectors (dx, dy) in flow-map pixels
     """
     B, _, H, W = flow.shape
     device = flow.device
+    scale = model_down / flow_down  # density-map → flow-map coordinate scale
     sampled_list = []
     for b in range(B):
         pts = points[b]  # (N,2)
         if pts.numel() == 0:
             sampled_list.append(torch.zeros((0, 2), device=device))
             continue
-        xs = pts[:, 0]
-        ys = pts[:, 1]
-        # normalize to [-1,1]
+        xs = pts[:, 0] * scale
+        ys = pts[:, 1] * scale
+        # normalize to [-1,1] in flow-map space
         nx = (xs / float(max(W - 1, 1))) * 2.0 - 1.0
         ny = (ys / float(max(H - 1, 1))) * 2.0 - 1.0
         grid = torch.stack((nx, ny), dim=1).unsqueeze(0).unsqueeze(0)  # (1,1,N,2)
-        # grid_sample expects (N,H_out,W_out,2) style, so we reshape flow to (1,2,H,W)
         f = flow[b:b+1]
         sampled = F.grid_sample(f, grid.view(1, -1, 1, 2), align_corners=True).view(2, -1).permute(1, 0)  # (N,2)
         sampled_list.append(sampled)
-    # pad to same N across batch by returning list of tensors
-    # For convenience, return list of (N_i,2) tensors per batch
     return sampled_list
 
 
-def warp_points_with_flow(points_list, flow_batch):
+def warp_points_with_flow(points_list, flow_batch, flow_down=2, model_down=4):
     """
     Warp a list of points (per-batch) using flow maps for corresponding frame-pairs.
+    Points are at model density-map resolution; flow is at flow-map resolution.
     Args:
-        points_list: list length B of tensors (N_i,2) in (x,y) pixels for previous frame
-        flow_batch: Tensor (B, 2, H, W) flow from prev->curr (dx,dy) in pixels
+        points_list: list length B of tensors (N_i,2) in (x,y) at model density-map resolution
+        flow_batch: Tensor (B, 2, H, W) flow from prev->curr (dx,dy) in flow-map pixels
+        flow_down: downsampling factor used when computing flow (e.g. 2)
+        model_down: downsampling factor of the model's density map (e.g. 4)
     Returns:
-        warped_list: list length B of tensors (N_i,2) warped to current frame coordinates
+        warped_list: list length B of tensors (N_i,2) warped to current frame, at model density-map resolution
     """
     B = flow_batch.shape[0]
     device = flow_batch.device
-    # prepare points tensor padded for sampling
+    scale = model_down / flow_down       # density→flow
+    inv_scale = flow_down / model_down   # flow→density
     maxN = max([p.shape[0] for p in points_list]) if len(points_list) > 0 else 0
     if maxN == 0:
         return [torch.zeros((0, 2), device=device) for _ in range(B)]
-    # build (B, N, 2) with padding (duplicate last or zeros)
     pts_padded = torch.zeros((B, maxN, 2), device=device)
-    mask = torch.zeros((B, maxN), dtype=torch.bool, device=device)
     for b in range(B):
         n = points_list[b].shape[0]
         if n > 0:
             pts_padded[b, :n] = points_list[b].to(device)
-            mask[b, :n] = True
-    sampled_list = sample_flow_at_points(flow_batch, pts_padded)  # returns list per batch
+    sampled_list = sample_flow_at_points(flow_batch, pts_padded, flow_down, model_down)
     warped = []
     for b in range(B):
         if points_list[b].shape[0] == 0:
             warped.append(points_list[b].new_zeros((0, 2)))
             continue
-        flow_vecs = sampled_list[b].to(points_list[b].device)
-        warped_pts = points_list[b] + flow_vecs
+        pts_flow = points_list[b].to(device) * scale          # to flow-map space
+        flow_vecs = sampled_list[b].to(device)                # flow displacement in flow-map pixels
+        warped_flow = pts_flow + flow_vecs                    # warp in flow-map space
+        warped_pts = warped_flow * inv_scale                  # back to density-map space
         warped.append(warped_pts)
     return warped
 
@@ -132,6 +136,30 @@ def prepare_p2r_seqs_from_points_list(points_list):
     So we simply return the points_list as-is (ensuring float and device consistency)
     """
     return [p.float() for p in points_list]
+
+
+def get_adaptive_pos_weight(current_epoch, stage1_epochs, total_epochs):
+    """Dynamic pos_weight decay across stages.
+
+    STAGE_1 (cur < stage1_epochs): fixed at 20.0
+    STAGE_2 first 40%: linear decay 20.0 → 2.0
+    STAGE_2 last 60%: fixed at 2.0
+    """
+    if total_epochs <= stage1_epochs:
+        return 20.0
+
+    if current_epoch < stage1_epochs:
+        return 20.0
+
+    stage2_epochs = total_epochs - stage1_epochs
+    tau = (current_epoch - stage1_epochs) / stage2_epochs
+    decay_end = 0.4
+
+    if tau < decay_end:
+        alpha = tau / decay_end
+        return 20.0 * (1.0 - alpha) + 2.0 * alpha
+    else:
+        return 2.0
 
 
 def check_min_batch(batch_tensor, min_bs=2):
@@ -153,6 +181,8 @@ def train_one_epoch(
     amp_enabled=True,
     min_batch_size=2,
     stage='sup',
+    stage1_epochs=25,
+    total_epochs=50,
 ):
     """
     Core training loop implementing truncated BPTT and temporal P2R calibration.
@@ -174,6 +204,8 @@ def train_one_epoch(
 
     logger = logging.getLogger('VGG16BN')
     num_batches = len(dataloader)
+    current_pos_weight = get_adaptive_pos_weight(epoch, stage1_epochs, total_epochs)
+    logger.info(f"[epoch {epoch}] adaptive pos_weight = {current_pos_weight:.2f}")
     pbar = tqdm(dataloader, desc=f'Epoch [{epoch}]', leave=False)
     
     epoch_loss = 0.0
@@ -208,7 +240,7 @@ def train_one_epoch(
             with autocast(enabled=amp_enabled):
                 lpred, _ = student(lframe, prev_h=None)
             ldots = [seq[0][0][:, :2].to(device) for seq in lseqs]
-            sup_loss = p2r(lpred, ldots, down=down)
+            sup_loss = p2r(lpred, ldots, down=down, pos_weight=current_pos_weight)
 
         if stage == 'sup':
             # Supervised only: backward on supervised loss
@@ -249,13 +281,13 @@ def train_one_epoch(
                 with torch.no_grad():
                     points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=0.3)
                     if flow_t_minus is not None:
-                        warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus)
+                        warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus, flow_down=2, model_down=down)
                     else:
                         warped_points_list = points_prev_list
 
                 seqs_for_loss = prepare_p2r_seqs_from_points_list(warped_points_list)
                 with autocast(enabled=amp_enabled):
-                    loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down, masks=None)
+                    loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down, masks=None, pos_weight=current_pos_weight)
 
                 loss = loss_p2r + sup_loss / (T - 1)
                 batch_loss += loss.item()
