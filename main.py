@@ -147,6 +147,17 @@ def main_worker(config):
                 teacher.load_state_dict(student.state_dict())
                 torch.cuda.empty_cache()
                 logger.info("Stage 2: teacher initialized from pre-trained student, CUDA cache cleared")
+                if model_name == 'emac':
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = param_group['lr'] * 3.0
+                    from torch.optim.lr_scheduler import CosineAnnealingLR
+                    lr_scheduler = CosineAnnealingLR(
+                        optimizer, T_max=config.TRAIN.EPOCHS - STAGE_1, eta_min=1e-6
+                    )
+                    logger.info(
+                        f"EMAC LR Warm Restart: lr={optimizer.param_groups[0]['lr']:.2e}, "
+                        f"T_max={config.TRAIN.EPOCHS - STAGE_1}, scheduler switched to CosineAnnealingLR"
+                    )
         
         temporal_train_one_epoch(
             epoch=epoch,

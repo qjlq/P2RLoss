@@ -245,8 +245,14 @@ def train_one_epoch(
             with autocast(enabled=amp_enabled):
                 if is_emac:
                     img_template = limg_batch[:, 1] if T > 1 else lframe
+                    if stage == 'semi' and epoch >= stage1_epochs:
+                        lframe_noisy = torch.clamp(lframe + torch.randn_like(lframe) * 0.05, 0.0, 1.0)
+                        img_template_noisy = torch.clamp(img_template + torch.randn_like(img_template) * 0.05, 0.0, 1.0)
+                    else:
+                        lframe_noisy = lframe
+                        img_template_noisy = img_template
                     density_ref = student.prepare_density_ref(ldots, img_shape=(H, W))
-                    lpred = student(lframe, templates=[img_template], density_ref=density_ref)
+                    lpred = student(lframe_noisy, templates=[img_template_noisy], density_ref=density_ref)
                 else:
                     lpred, _ = student(lframe, prev_h=None)
             sup_loss = p2r(lpred, ldots, down=down, pos_weight=current_pos_weight)
@@ -266,13 +272,25 @@ def train_one_epoch(
             if is_emac:
                 check_min_batch(uimg_batch, min_bs=min_batch_size)
                 batch_loss = 0.0
+
+                # === Asymmetric augmentation for EMAC (student gets noise, teacher stays clean) ===
+                if epoch >= stage1_epochs:
+                    uimg_batch_teacher = uimg_batch.clone()
+                    noise = torch.randn_like(uimg_batch) * 0.05
+                    uimg_batch = torch.clamp(uimg_batch + noise, 0.0, 1.0)
+                else:
+                    uimg_batch_teacher = uimg_batch
+
                 with torch.no_grad():
-                    teacher_pred_fuse = teacher(uimg_batch[:, 0], templates=[uimg_batch[:, 1]])
+                    teacher_pred_fuse = teacher(
+                        uimg_batch_teacher[:, 0], templates=[uimg_batch_teacher[:, 1]]
+                    )
                     teacher_pred_prev = teacher_pred_fuse.detach()
 
                 for t in range(1, T):
                     optimizer.zero_grad()
                     frame_t = uimg_batch[:, t]
+                    frame_t_teacher = uimg_batch_teacher[:, t]
                     flow_t_minus = None
                     if uflows_batch is not None:
                         flow_t_minus = uflows_batch[:, t - 1]
@@ -305,7 +323,9 @@ def train_one_epoch(
                     update_ema(student, teacher, ema_alpha)
 
                     with torch.no_grad():
-                        teacher_pred_fuse = teacher(frame_t, templates=[uimg_batch[:, (t + 1) % T]])
+                        teacher_pred_fuse = teacher(
+                            frame_t_teacher, templates=[uimg_batch_teacher[:, (t + 1) % T]]
+                        )
                         teacher_pred_prev = teacher_pred_fuse.detach()
             else:
                 check_min_batch(uimg_batch, min_bs=min_batch_size)

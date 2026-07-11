@@ -36,15 +36,26 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, scaler, logger):
         scaler.load_state_dict(checkpoint['scaler'])
         logger.info("[load scaler]: OK")
     saved_epoch = checkpoint.get('epoch', -1)
+    if isinstance(saved_epoch, str):
+        import re
+        match = re.search(r'(\d+)$', saved_epoch)
+        saved_epoch = int(match.group(1)) if match else -1
     max_accuracy = checkpoint.get('max_accuracy', [1e6] * 3)
     return saved_epoch, max_accuracy
 
 def save_checkpoint(config, epoch, model, optimizer, lr_scheduler, scaler, max_accuracy, logger):
     teacher, student = model
+    # Extract numeric epoch for checkpoint metadata (handles "best_epoch25" → 25)
+    if isinstance(epoch, str):
+        import re
+        match = re.search(r'(\d+)$', epoch)
+        numeric_epoch = int(match.group(1)) if match else -1
+    else:
+        numeric_epoch = epoch
     save_state = {
         'teacher': teacher.state_dict(),
         'student': student.state_dict(),
-        'epoch': epoch,
+        'epoch': numeric_epoch,
         'optimizer': optimizer.state_dict() if optimizer else None,
         'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler else None,
         'scaler': scaler.state_dict() if scaler else None,
