@@ -7,31 +7,72 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from functools import partial
 
 EMAC_PATH = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'E-MAC'))
 if EMAC_PATH not in sys.path:
     sys.path.insert(0, EMAC_PATH)
 
-# Mock the CUDA correlation extension so PWCNet can import without compilation.
-# PWCNet is never called at runtime — the wrapper uses precomputed RAFT flow.
-import types as _types
+# ── Pure PyTorch Correlation fallback for PWC-Net ──────────────────────────
+# Replaces the un-compilable correlation_cuda CUDA extension with a native
+# PyTorch implementation using unfold + einsum.
+
+class _CorrelationPyTorch(nn.Module):
+    """Pure-PyTorch correlation layer (cost volume).
+    For each position in f1, compute dot-product similarity with a
+    (2*max_displacement+1)² neighborhood in f2.
+    """
+    def __init__(self, pad_size=4, kernel_size=1, max_displacement=4,
+                 stride1=1, stride2=1, corr_multiply=1):
+        super().__init__()
+        self.pad_size = pad_size
+        self.kernel_size = kernel_size
+        self.max_displacement = max_displacement
+        self.stride1 = stride1
+        self.stride2 = stride2
+        self.corr_multiply = corr_multiply
+
+    def forward(self, f1, f2):
+        B, C, H, W = f1.shape
+        D = self.max_displacement
+        kW = 2 * D + 1
+
+        # Pad f2 by D to keep output spatial size = H × W
+        f2_unfold = F.unfold(f2, kernel_size=(kW, kW), padding=D,
+                             stride=self.stride2)                     # (B, C*kW², H*W)
+        f2_unfold = f2_unfold.view(B, C, kW * kW, H * W)             # (B, C, kW², H*W)
+
+        f1_flat = f1.view(B, C, H * W).unsqueeze(2)                  # (B, C, 1, H*W)
+        corr = (f1_flat * f2_unfold).sum(dim=1)                      # (B, kW², H*W)
+        if self.corr_multiply != 1:
+            corr = corr / C
+        return corr.view(B, kW * kW, H, W)
+
+
+# Inject the PyTorch Correlation into the correlation_package module path
+# so PWCNet's `from .correlation_package.correlation import Correlation`
+# resolves to our pure-PyTorch version.
+import importlib
+_corr_mod = types.ModuleType('correlation_package._correlation')
+_corr_mod.Correlation = _CorrelationPyTorch
+sys.modules['emac.models.correlation_package.correlation'] = _corr_mod
+
+# Also ensure correlation_cuda mock exists so correlation.py can import it
 try:
     import correlation_cuda
 except ImportError:
-    import importlib
-    _mock_cc = _types.ModuleType('correlation_cuda')
-    _mock_cc.__file__ = os.path.join(EMAC_PATH, 'emac', 'models', 'correlation_package', '_mock_corr.py')
+    _mock_cc = types.ModuleType('correlation_cuda')
+    _mock_cc.__file__ = os.path.join(EMAC_PATH, 'emac', 'models',
+                                     'correlation_package', '_mock_corr.py')
     _mock_cc.__package__ = 'correlation_cuda'
-    _mock_cc.__path__ = []
-    _mock_cc.__spec__ = importlib.machinery.ModuleSpec(name='correlation_cuda', loader=None, origin=_mock_cc.__file__)
-    _mock_cc.Correlation = type('Correlation', (nn.Module,), {'forward': lambda self, *a, **kw: None})
+    _mock_cc.__spec__ = importlib.machinery.ModuleSpec(
+        name='correlation_cuda', loader=None, origin=_mock_cc.__file__)
     sys.modules['correlation_cuda'] = _mock_cc
 
 from emac.emac import EMac
 from emac.input_adapters import PatchedInputAdapter
 from emac.output_adapters import SpatialOutputAdapter
 from emac.emac_utils import TransFuse, Block, trunc_normal_, warp, denormalize
-from functools import partial
 
 
 def _render_gaussian_density(points, shape, sigma=4, down=1):
@@ -160,14 +201,47 @@ class EMACWrapper(nn.Module):
         self._fuse = fuse_module
         self._encoder = self.emac.encoder
 
-    def forward(self, img_current, templates=None, flow=None, density_ref=None, task_masks=None):
-        """Forward pass using precomputed flow (bypasses PWCNet).
+    @property
+    def pwc(self):
+        """Access the built-in PWC-Net optical flow network."""
+        return self.emac.pwc
 
-        img_current: (B, 3, H, W) current frame
-        templates: list of one tensor (B, 3, H, W) — previous / template frame
-        flow: (B, 2, H, W) precomputed RAFT flow (forward: template → current)
-        density_ref: (B, 1, H, W) optional coarse density for masking guidance
-        task_masks: optional precomputed masks dict
+    def compute_flow(self, img_prev, img_cur):
+        """End-to-end PWC-Net flow from prev→cur.
+
+        Args:
+            img_prev, img_cur: (B, 3, H, W) in ImageNet-normalized space
+        Returns:
+            flo: (B, 2, H, W) flow at original resolution (forward: prev→cur)
+        """
+        B, C, H, W = img_cur.shape
+        permute_bgr = [2, 1, 0]
+        img_all = torch.cat([
+            denormalize(img_cur)[:, permute_bgr] / 255.0,
+            denormalize(img_prev)[:, permute_bgr] / 255.0,
+        ], dim=1).to(img_cur.device)
+
+        flo_raw = self.emac.pwc(img_all)
+        flo_shape = flo_raw.shape[-2:]
+        flo = F.interpolate(flo_raw, (H, W), mode='bilinear', align_corners=False)
+        flo = flo * (flo_shape[0] * flo_shape[1]) / (H * W)
+        return flo
+
+    def forward(self, img_current, templates=None, flow=None, density_ref=None, task_masks=None,
+                return_aux=False):
+        """Forward pass.
+
+        When ``flow`` is provided (precomputed, e.g. RAFT), uses it for
+        temporal fusion.  When ``flow`` is None, falls back to the built-in
+        PWC-Net.
+
+        Args:
+            img_current: (B, 3, H, W) current frame
+            templates: list of one tensor (B, 3, H, W) — previous / template frame
+            flow: (B, 2, H, W) optional precomputed optical flow
+            density_ref: (B, 1, H, W) coarse density for masking guidance
+            task_masks: optional precomputed masks dict
+            return_aux: if True, returns (pred_fuse, img_warp, pred_prev_warp, pred_cur)
         """
         img_template = templates[0] if templates else img_current
         B, C, H, W = img_current.shape
@@ -234,17 +308,22 @@ class EMACWrapper(nn.Module):
                 ids_keep=ids_keep_prev, ids_restore=ids_restore_prev
             )
 
-        # Temporal fusion with precomputed flow
+        # Temporal fusion with PWC-Net or precomputed flow
         with torch.cuda.amp.autocast(enabled=False):
             if flow is not None:
                 flow_resized = F.interpolate(flow, size=(H, W), mode='bilinear', align_corners=False)
                 scale = torch.tensor([flow.shape[-1] / W, flow.shape[-2] / H], device=flow.device)
                 flow_resized = flow_resized * scale.view(1, 2, 1, 1)
                 pred_prev_warp = warp(pred_prev, flow_resized.detach())
+                flo = None
             else:
-                pred_prev_warp = pred_prev
+                flo = self.compute_flow(img_template, img_current)
+                pred_prev_warp = warp(pred_prev, flo.detach())
 
             pred_fuse = self._fuse_dense(pred_prev_warp, pred_cur)
+
+        if return_aux:
+            return pred_fuse, flo, pred_prev_warp, pred_cur
         return pred_fuse
 
     def _fuse_dense(self, pred_prev_warp, pred_cur):

@@ -22,6 +22,35 @@ from losses.p2rloss import P2RLoss
 from tqdm import tqdm
 import logging
 
+# Import E-MAC utilities for built-in flow computation (only used by EMAC branch)
+try:
+    from emac.emac_utils import denormalize, warp as emac_warp
+except ImportError:
+    def denormalize(x, mean=None, std=None):
+        if mean is None:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+        import torchvision.transforms.functional as TF
+        return TF.normalize(x.clone(),
+                            mean=[-m / s for m, s in zip(mean, std)],
+                            std=[1 / s for s in std])
+
+    def emac_warp(x, flo):
+        B, C, H, W = x.shape
+        xx = torch.arange(W, device=x.device).view(1, -1).repeat(H, 1)
+        yy = torch.arange(H, device=x.device).view(-1, 1).repeat(1, W)
+        grid = torch.stack([xx, yy], dim=0).float().unsqueeze(0).repeat(B, 1, 1, 1)
+        vgrid = grid + flo
+        vgrid[:, 0] = 2.0 * vgrid[:, 0] / max(W - 1, 1) - 1.0
+        vgrid[:, 1] = 2.0 * vgrid[:, 1] / max(H - 1, 1) - 1.0
+        return F.grid_sample(x, vgrid.permute(0, 2, 3, 1), mode='bilinear', align_corners=True)
+
+
+def tv_loss(x):
+    """Total variation smoothness loss."""
+    return (F.l1_loss(x[:, :, :-1, :], x[:, :, 1:, :]) +
+            F.l1_loss(x[:, :, :, :-1], x[:, :, :, 1:])) / x.size(1)
+
 
 def update_ema(student, teacher, alpha):
     """Exponential moving average of parameters: teacher = alpha * teacher + (1-alpha) * student"""
@@ -245,14 +274,9 @@ def train_one_epoch(
             with autocast(enabled=amp_enabled):
                 if is_emac:
                     img_template = limg_batch[:, 1] if T > 1 else lframe
-                    if stage == 'semi' and epoch >= stage1_epochs:
-                        lframe_noisy = torch.clamp(lframe + torch.randn_like(lframe) * 0.05, 0.0, 1.0)
-                        img_template_noisy = torch.clamp(img_template + torch.randn_like(img_template) * 0.05, 0.0, 1.0)
-                    else:
-                        lframe_noisy = lframe
-                        img_template_noisy = img_template
+                    # Labeled data always uses clean input (no asymmetric noise)
                     density_ref = student.prepare_density_ref(ldots, img_shape=(H, W))
-                    lpred = student(lframe_noisy, templates=[img_template_noisy], density_ref=density_ref)
+                    lpred = student(lframe, templates=[img_template], density_ref=density_ref)
                 else:
                     lpred, _ = student(lframe, prev_h=None)
             sup_loss = p2r(lpred, ldots, down=down, pos_weight=current_pos_weight)
@@ -273,7 +297,7 @@ def train_one_epoch(
                 check_min_batch(uimg_batch, min_bs=min_batch_size)
                 batch_loss = 0.0
 
-                # === Asymmetric augmentation for EMAC (student gets noise, teacher stays clean) ===
+                # === Asymmetric augmentation (student gets noise, teacher stays clean) ===
                 if epoch >= stage1_epochs:
                     uimg_batch_teacher = uimg_batch.clone()
                     noise = torch.randn_like(uimg_batch) * 0.05
@@ -291,33 +315,52 @@ def train_one_epoch(
                     optimizer.zero_grad()
                     frame_t = uimg_batch[:, t]
                     frame_t_teacher = uimg_batch_teacher[:, t]
-                    flow_t_minus = None
-                    if uflows_batch is not None:
-                        flow_t_minus = uflows_batch[:, t - 1]
 
+                    # Built-in PWC-Net flow instead of external .npy
                     with autocast(enabled=amp_enabled):
-                        student_pred_t = student(frame_t, templates=[uimg_batch[:, (t + 1) % T]])
+                        student_pred_t, flo_t, pred_prev_warp_raw, pred_cur_raw = student(
+                            frame_t, templates=[uimg_batch[:, (t + 1) % T]],
+                            return_aux=True
+                        )
 
                     with torch.no_grad():
-                        points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=0.3)
-                        if flow_t_minus is not None:
-                            warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus, flow_down=2, model_down=down)
-                        else:
-                            warped_points_list = points_prev_list
+                        pseudo_thresh = 0.85 if stage == 'semi' else 0.3
+                        points_prev_list = generate_points_from_density(
+                            teacher_pred_prev, threshold=pseudo_thresh
+                        )
 
-                    seqs_for_loss = prepare_p2r_seqs_from_points_list(warped_points_list)
+                    seqs_for_loss = prepare_p2r_seqs_from_points_list(points_prev_list)
                     with autocast(enabled=amp_enabled):
-                        loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down, masks=None, pos_weight=current_pos_weight)
+                        loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down,
+                                       masks=None, pos_weight=current_pos_weight)
 
-                    loss = loss_p2r + sup_loss / max(T - 1, 1)
-                    batch_loss += loss.item()
+                    # ── Multi-task loss composition ──────────────────────────
+                    # 1. Current-frame density loss (warped pseudo-labels)
+                    loss_total = loss_p2r + sup_loss / max(T - 1, 1)
+
+                    # 2. Optical-flow photometric loss (warped RGB MSE)
+                    if flo_t is not None:
+                        perm_bgr = [2, 1, 0]
+                        cur_rgb = denormalize(frame_t_teacher)[:, perm_bgr] / 255.0
+                        prev_rgb = denormalize(
+                            uimg_batch_teacher[:, (t + 1) % T],
+                        )[:, perm_bgr] / 255.0
+                        img_warp = emac_warp(prev_rgb, flo_t)
+                        opt_loss = F.mse_loss(img_warp, cur_rgb) * 0.05
+
+                        # 3. Flow smoothness (TV)
+                        flow_tv = tv_loss(flo_t) * 0.01
+
+                        loss_total = loss_total + opt_loss + flow_tv
+
+                    batch_loss += loss_total.item()
 
                     if amp_enabled:
-                        scaler.scale(loss).backward()
+                        scaler.scale(loss_total).backward()
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        loss.backward()
+                        loss_total.backward()
                         optimizer.step()
 
                     update_ema(student, teacher, ema_alpha)
@@ -351,7 +394,8 @@ def train_one_epoch(
                         student_pred_t, student_h = student(frame_t, student_h)
 
                     with torch.no_grad():
-                        points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=0.3)
+                        pseudo_thresh = 0.85 if stage == 'semi' else 0.3
+                        points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=pseudo_thresh)
                         if flow_t_minus is not None:
                             warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus, flow_down=2, model_down=down)
                         else:

@@ -136,6 +136,25 @@ def main_worker(config):
     epostack, maestack, msestack, lossstack = [], [], [], []
     
     resumed = config.TRAIN.START_EPOCH > 0
+
+    # If resuming into STAGE_2, apply progressive freezing immediately
+    if resumed and config.TRAIN.START_EPOCH >= STAGE_1 and model_name == 'emac':
+        for model_obj in [student, teacher]:
+            enc = model_obj.emac.encoder if hasattr(model_obj, 'emac') else getattr(model_obj, 'encoder', None)
+            if enc is not None and hasattr(enc, 'children'):
+                for blk in list(enc.children())[:8]:
+                    for p in blk.parameters():
+                        p.requires_grad = False
+        optimizer = optim.Adam(
+            [{"params": [p for p in student.parameters() if p.requires_grad]}],
+            lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY,
+        )
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        lr_scheduler = CosineAnnealingLR(
+            optimizer, T_max=config.TRAIN.EPOCHS - STAGE_1, eta_min=1e-6
+        )
+        n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+        logger.info(f"EMAC progressive freezing applied (resume into STAGE_2): {n_trainable/1e6:.1f}M trainable params")
     
     epoch_pbar = tqdm(range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS), desc='Overall')
     for epoch in epoch_pbar:
@@ -148,6 +167,31 @@ def main_worker(config):
                 torch.cuda.empty_cache()
                 logger.info("Stage 2: teacher initialized from pre-trained student, CUDA cache cleared")
                 if model_name == 'emac':
+                    # ── Progressive layer freezing: lock first 8 ViT blocks ──
+                    for model_obj in [student, teacher]:
+                        enc = model_obj.emac.encoder if hasattr(model_obj, 'emac') else getattr(model_obj, 'encoder', None)
+                        if enc is not None and hasattr(enc, 'children'):
+                            blocks = list(enc.children())
+                            for blk in blocks[:8]:
+                                for p in blk.parameters():
+                                    p.requires_grad = False
+                            # Log trainable vs frozen count
+                            total_enc = sum(p.numel() for p in enc.parameters())
+                            frozen_enc = sum(p.numel() for p in enc.parameters() if not p.requires_grad)
+                            logger.info(
+                                f"EMAC encoder frozen={frozen_enc/1e6:.1f}M / {total_enc/1e6:.1f}M "
+                                f"(blocks[:8] frozen, blocks[8:] + TransFuse trainable)"
+                            )
+
+                    # ── Rebuild optimizer with only trainable params ──
+                    optimizer = optim.Adam(
+                        [{"params": [p for p in student.parameters() if p.requires_grad]}],
+                        lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY,
+                    )
+                    n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+                    logger.info(f"EMAC optimizer rebuilt: {n_trainable/1e6:.1f}M trainable params")
+
+                    # ── LR Warm Restart ──
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = param_group['lr'] * 3.0
                     from torch.optim.lr_scheduler import CosineAnnealingLR
