@@ -21,6 +21,7 @@ from torch.cuda.amp import autocast, GradScaler
 from losses.p2rloss import P2RLoss
 from tqdm import tqdm
 import logging
+from models.forward_adapter import ModelForwardAdapter
 
 # Import E-MAC utilities for built-in flow computation (only used by EMAC branch)
 try:

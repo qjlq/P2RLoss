@@ -207,25 +207,31 @@ class EMACWrapper(nn.Module):
         return self.emac.pwc
 
     def compute_flow(self, img_prev, img_cur):
-        """End-to-end PWC-Net flow from prev→cur.
+        """End-to-end PWC-Net flow from prev→cur, upscaled to full resolution.
 
         Args:
             img_prev, img_cur: (B, 3, H, W) in ImageNet-normalized space
         Returns:
-            flo: (B, 2, H, W) flow at original resolution (forward: prev→cur)
+            flo: (B, 2, H, W) flow at original resolution, upscaled from native PWC
         """
         B, C, H, W = img_cur.shape
+        flo_raw = self._compute_flow_raw(img_prev, img_cur)          # (B, 2, H//4, W//4)
+        flo = F.interpolate(flo_raw, (H, W), mode='bilinear', align_corners=False)
+        flo = flo * (flo_raw.shape[-2] * flo_raw.shape[-1]) / (H * W)
+        return flo
+
+    def _compute_flow_raw(self, img_prev, img_cur):
+        """PWC-Net flow at native resolution (H_img//4 × W_img//4).
+
+        Returns:
+            flo_raw: (B, 2, H//4, W//4) — no bilinear upscaling
+        """
         permute_bgr = [2, 1, 0]
         img_all = torch.cat([
             denormalize(img_cur)[:, permute_bgr] / 255.0,
             denormalize(img_prev)[:, permute_bgr] / 255.0,
         ], dim=1).to(img_cur.device)
-
-        flo_raw = self.emac.pwc(img_all)
-        flo_shape = flo_raw.shape[-2:]
-        flo = F.interpolate(flo_raw, (H, W), mode='bilinear', align_corners=False)
-        flo = flo * (flo_shape[0] * flo_shape[1]) / (H * W)
-        return flo
+        return self.emac.pwc(img_all)
 
     def forward(self, img_current, templates=None, flow=None, density_ref=None, task_masks=None,
                 return_aux=False):
@@ -308,7 +314,7 @@ class EMACWrapper(nn.Module):
                 ids_keep=ids_keep_prev, ids_restore=ids_restore_prev
             )
 
-        # Temporal fusion with PWC-Net or precomputed flow
+        # Temporal fusion: low-res warp preserves micro-motion, then upsample warped density
         with torch.cuda.amp.autocast(enabled=False):
             if flow is not None:
                 flow_resized = F.interpolate(flow, size=(H, W), mode='bilinear', align_corners=False)
@@ -317,8 +323,15 @@ class EMACWrapper(nn.Module):
                 pred_prev_warp = warp(pred_prev, flow_resized.detach())
                 flo = None
             else:
-                flo = self.compute_flow(img_template, img_current)
-                pred_prev_warp = warp(pred_prev, flo.detach())
+                # Warp at native PWC resolution (H//4, W//4) to avoid flow over-smoothing
+                flo_raw = self._compute_flow_raw(img_template, img_current)     # (B,2,H/4,W/4)
+                pred_prev_low = F.avg_pool2d(pred_prev, 4, 4)                   # (B,1,H/4,W/4)
+                pred_prev_warp_low = warp(pred_prev_low, flo_raw.detach())
+                pred_prev_warp = F.interpolate(pred_prev_warp_low, (H, W),
+                                               mode='bilinear', align_corners=False)
+                # Keep upscaled flow for opt_loss / TV loss in train loop
+                flo = F.interpolate(flo_raw, (H, W), mode='bilinear', align_corners=False)
+                flo = flo * (flo_raw.shape[-2] * flo_raw.shape[-1]) / (H * W)
 
             pred_fuse = self._fuse_dense(pred_prev_warp, pred_cur)
 

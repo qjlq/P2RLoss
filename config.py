@@ -48,12 +48,26 @@ _C.MODEL.NAME = 'VGG16BN'
 _C.MODEL.RESUME = ''
 _C.MODEL.FACTOR = 1
 _C.MODEL.LOSS = 'P2R'
+
+# -----------------------------------------------------------------------------
+# EMAC-specific settings (at root level so CLI --opts can override directly)
+# -----------------------------------------------------------------------------
+_C.EMAC_DROP_PATH = 0.3
+_C.EMAC_INPUT_SIZE = 256
+_C.EMAC_PATCH_SIZE = 16
+_C.EMAC_NUM_ENCODED_TOKENS = 128
+_C.EMAC_TOTAL_NUM_TOKENS = 256
+_C.EMAC_DECODER_DEPTH = 2
+_C.EMAC_DECODER_DIM = 512
+_C.EMAC_DECODER_NUM_HEADS = 16
+_C.EMAC_NUM_GLOBAL_TOKENS = 1
+_C.EMAC_DENSITY_SIGMA = 4
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.START_EPOCH = 0
-_C.TRAIN.EPOCHS = 50
+_C.TRAIN.EPOCHS = 300
 _C.TRAIN.BASE_LR = 5e-5
 _C.TRAIN.BACKBONE_LR = 1e-5
 _C.TRAIN.WEIGHT_DECAY = 1e-4

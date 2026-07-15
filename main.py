@@ -22,8 +22,9 @@ from models import build_model
 from datasets import build_loader
 from losses import build_loss
 from logger import create_logger
-from p2r_utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor, plot_curve, set_seed
+from p2r_utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor, plot_curve, set_seed, create_optimizer_groups
 from train.train_loop import train_one_epoch as temporal_train_one_epoch
+from models.forward_adapter import ModelForwardAdapter
 
 STAGE_1, STAGE_2 = 0, 1
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -63,7 +64,7 @@ def main_worker(config):
     data_loader_train, data_loader_val = build_loader(config.DATA, mode='train'), build_loader(config.DATA, mode='test')
 
     logger.info(f"Creating model with:{config.MODEL.NAME}")
-    student, teacher = build_model(config.MODEL)
+    student, teacher = build_model(config)
     # ensure teacher is a copy of student with requires_grad=False
     teacher = copy.deepcopy(student)
     for p in teacher.parameters():
@@ -75,18 +76,16 @@ def main_worker(config):
 
     model_name = config.MODEL.NAME.lower()
 
-    param_dicts = [
-        {
-            "params": [p for n, p in student.named_parameters()
-                       if "encoders" not in n and p.requires_grad]
-        }, {
-            "params": [p for n, p in student.named_parameters()
-                       if "encoders" in n and p.requires_grad],
-            "lr": config.TRAIN.BACKBONE_LR,
-        },
-    ] if model_name == 'vgg16bn' else [
-        {"params": [p for p in student.parameters() if p.requires_grad]},
-    ]
+    # ── Generic optimizer groups (backbone vs. head) ────────────────────────
+    backbone_kw = {
+        'vgg16bn': ['encoders'],
+        'emac': ['encoder.blocks', 'input_adapters', 'pwc'],
+    }.get(model_name, [])
+    param_dicts = create_optimizer_groups(
+        student, base_lr=config.TRAIN.BASE_LR,
+        backbone_lr=config.TRAIN.BACKBONE_LR,
+        backbone_keywords=backbone_kw,
+    )
 
     optimizer = optim.Adam(param_dicts, lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY)
     accumulation_steps = 2 if model_name == 'emac' else 1
@@ -146,7 +145,9 @@ def main_worker(config):
                     for p in blk.parameters():
                         p.requires_grad = False
         optimizer = optim.Adam(
-            [{"params": [p for p in student.parameters() if p.requires_grad]}],
+            create_optimizer_groups(student, base_lr=config.TRAIN.BASE_LR,
+                                    backbone_lr=config.TRAIN.BACKBONE_LR,
+                                    backbone_keywords=backbone_kw),
             lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY,
         )
         from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -184,9 +185,14 @@ def main_worker(config):
                             )
 
                     # ── Rebuild optimizer with only trainable params ──
+                    param_dicts = create_optimizer_groups(
+                        student, base_lr=config.TRAIN.BASE_LR,
+                        backbone_lr=config.TRAIN.BACKBONE_LR,
+                        backbone_keywords=backbone_kw,
+                    )
                     optimizer = optim.Adam(
-                        [{"params": [p for p in student.parameters() if p.requires_grad]}],
-                        lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY,
+                        param_dicts, lr=config.TRAIN.BASE_LR,
+                        weight_decay=config.TRAIN.WEIGHT_DECAY,
                     )
                     n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
                     logger.info(f"EMAC optimizer rebuilt: {n_trainable/1e6:.1f}M trainable params")

@@ -27,8 +27,11 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, scaler, logger):
     msg_s = student.load_state_dict(checkpoint['student'], strict=False)
     logger.info(f"[load student]: {msg_s}")
     if optimizer is not None and 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        logger.info("[load optimizer]: OK")
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            logger.info("[load optimizer]: OK")
+        except (ValueError, KeyError) as e:
+            logger.warning(f"[load optimizer]: SKIPPED (group mismatch: {e})")
     if lr_scheduler is not None and 'lr_scheduler' in checkpoint:
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         logger.info("[load lr_scheduler]: OK")
@@ -121,3 +124,49 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def create_optimizer_groups(model, base_lr, backbone_lr, backbone_keywords=None):
+    """Generic optimizer param group factory.
+
+    Automatically splits model parameters into two groups based on
+    ``backbone_keywords``.  Parameters whose name contains any of the
+    keywords get ``backbone_lr``; all others get ``base_lr``.
+    Parameters with ``requires_grad=False`` are excluded.
+
+    Args:
+        model:         nn.Module instance
+        base_lr:       learning rate for non-backbone (head) parameters
+        backbone_lr:   learning rate for backbone parameters
+        backbone_keywords: list of substrings to identify backbone params.
+                          If None or empty, all params are in a single group.
+
+    Returns:
+        list of dicts suitable for ``optim.Adam(param_groups, ...)``
+    """
+    if not backbone_keywords:
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        return [{"params": trainable}]
+
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(kw in name for kw in backbone_keywords):
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    groups = []
+    if head_params:
+        groups.append({"params": head_params})
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": backbone_lr})
+
+    if not groups:
+        raise RuntimeError(
+            "create_optimizer_groups: no trainable parameters found "
+            f"(backbone_keywords={backbone_keywords})"
+        )
+    return groups
