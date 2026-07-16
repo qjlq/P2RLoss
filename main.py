@@ -89,7 +89,33 @@ def main_worker(config):
 
     optimizer = optim.Adam(param_dicts, lr=config.TRAIN.BASE_LR, weight_decay=config.TRAIN.WEIGHT_DECAY)
     accumulation_steps = 2 if model_name == 'emac' else 1
-    
+
+    # # ── Debug: 檢查優化器參數分組 ─────────────────────────────────────────
+    # print("\n" + "=" * 60)
+    # print("🔍 Optimizer Param Group Debug")
+    # print(f"Model: {config.MODEL.NAME}")
+    # print("-" * 60)
+    # for i, group in enumerate(optimizer.param_groups):
+    #     lr = group.get('lr', 'N/A')
+    #     n_params = len(group['params'])
+    #     # 取前 3 個參數名稱作為樣本
+    #     sample_names = []
+    #     count = 0
+    #     for name, p in student.named_parameters():
+    #         if p.requires_grad and any(p is g for g in group['params']):
+    #             sample_names.append(name)
+    #             count += 1
+    #             if count >= 3:
+    #                 break
+    #     print(f"Group {i}: {n_params} tensors, lr={lr}")
+    #     if sample_names:
+    #         for sn in sample_names:
+    #             print(f"  ├─ {sn}")
+    #     if count < n_params:
+    #         print(f"  └─ ... and {n_params - count} more")
+    # print("=" * 60 + "\n")
+    # sys.exit(0)
+    # # ── Debug End ──────────────────────────────────────────────────────────
 
     n_parameters = sum(p.numel() for p in student.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")

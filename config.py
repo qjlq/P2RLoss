@@ -67,7 +67,7 @@ _C.EMAC_DENSITY_SIGMA = 4
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.START_EPOCH = 0
-_C.TRAIN.EPOCHS = 300
+_C.TRAIN.EPOCHS = 50
 _C.TRAIN.BASE_LR = 5e-5
 _C.TRAIN.BACKBONE_LR = 1e-5
 _C.TRAIN.WEIGHT_DECAY = 1e-4

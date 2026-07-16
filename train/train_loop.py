@@ -282,6 +282,23 @@ def train_one_epoch(
                     lpred, _ = student(lframe, prev_h=None)
             sup_loss = p2r(lpred, ldots, down=down, pos_weight=current_pos_weight)
 
+            # ── Debug: 校驗實際降採樣率 vs self.down ──────────────────────
+            Hin, Win = lframe.shape[-2], lframe.shape[-1]
+            Hout, Wout = lpred.shape[-2], lpred.shape[-1]
+            actual_down_h = Hin / Hout
+            actual_down_w = Win / Wout
+            assert abs(actual_down_h - down) < 1e-4 and abs(actual_down_w - down) < 1e-4, (
+                f"\n{'='*60}\n"
+                f"🔴 down 參數不匹配！\n"
+                f"  模型: {model_name}\n"
+                f"  輸入尺寸: ({Hin}, {Win})\n"
+                f"  輸出尺寸: ({Hout}, {Wout})\n"
+                f"  實際縮放: ({actual_down_h:.2f}x, {actual_down_w:.2f}x)\n"
+                f"  設定 down: {down}x\n"
+                f"  建議: 修正模型 __init__ 中 self.down = {actual_down_h:.0f}\n"
+                f"{'='*60}"
+            )
+
         if stage == 'sup':
             optimizer.zero_grad()
             if amp_enabled:

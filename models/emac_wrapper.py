@@ -157,7 +157,7 @@ class EMACWrapper(nn.Module):
         self.patch_size = patch_size
         self.num_encoded_tokens = num_encoded_tokens
         self.total_num_tokens = total_num_tokens
-        self.down = 4
+        self.down = 1
 
         input_adapters = {
             "rgb": PatchedInputAdapter(
