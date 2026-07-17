@@ -157,7 +157,7 @@ class EMACWrapper(nn.Module):
         self.patch_size = patch_size
         self.num_encoded_tokens = num_encoded_tokens
         self.total_num_tokens = total_num_tokens
-        self.down = 1
+        self.down = 4
 
         input_adapters = {
             "rgb": PatchedInputAdapter(
@@ -233,22 +233,7 @@ class EMACWrapper(nn.Module):
         ], dim=1).to(img_cur.device)
         return self.emac.pwc(img_all)
 
-    def forward(self, img_current, templates=None, flow=None, density_ref=None, task_masks=None,
-                return_aux=False):
-        """Forward pass.
-
-        When ``flow`` is provided (precomputed, e.g. RAFT), uses it for
-        temporal fusion.  When ``flow`` is None, falls back to the built-in
-        PWC-Net.
-
-        Args:
-            img_current: (B, 3, H, W) current frame
-            templates: list of one tensor (B, 3, H, W) — previous / template frame
-            flow: (B, 2, H, W) optional precomputed optical flow
-            density_ref: (B, 1, H, W) coarse density for masking guidance
-            task_masks: optional precomputed masks dict
-            return_aux: if True, returns (pred_fuse, img_warp, pred_prev_warp, pred_cur)
-        """
+    def forward(self, img_current, templates=None, flow=None, density_ref=None, task_masks=None, return_aux=False):
         img_template = templates[0] if templates else img_current
         B, C, H, W = img_current.shape
 
@@ -259,17 +244,12 @@ class EMACWrapper(nn.Module):
                        else torch.zeros(B, 1, 2, H, W, device=img_current.device),
         }
 
-        # E-MAC core logic (without PWCNet); run in fp32 for stability
+        # E-MAC 特徵提取 (保持不變)
         B = x_dict["rgb"].shape[0]
         with torch.cuda.amp.autocast(enabled=False):
-            inp_cur = {
-                d: self._input_adapters[d](x_dict[d][:, :, -1].float())
-                for d in self._input_adapters if d in x_dict
-            }
-            inp_prev = {
-                d: self._input_adapters[d](x_dict[d][:, :, 0].float())
-                for d in self._input_adapters if d in x_dict
-            }
+            inp_cur = { d: self._input_adapters[d](x_dict[d][:, :, -1].float()) for d in self._input_adapters if d in x_dict }
+            inp_prev = { d: self._input_adapters[d](x_dict[d][:, :, 0].float()) for d in self._input_adapters if d in x_dict }
+        
         input_info = self.emac.generate_input_info(inp_cur, (H, W))
         input_info_prev = self.emac.generate_input_info(inp_prev, (H, W))
 
@@ -313,31 +293,32 @@ class EMACWrapper(nn.Module):
                 encoder_tokens=enc_prev, input_info=input_info_prev,
                 ids_keep=ids_keep_prev, ids_restore=ids_restore_prev
             )
+            
+            # ── Temporal fusion at native PWC resolution ─────────────────
+            # pred_cur/pred_prev are (B, 1, H, W) at full resolution.
+            # Warp at 1/4 scale to preserve flow micro-motion, then upsample
+            # the warped density back to full res for TransFuse fusion.
+            with torch.cuda.amp.autocast(enabled=False):
+                feat_H, feat_W = H // 4, W // 4
 
-        # Temporal fusion: low-res warp preserves micro-motion, then upsample warped density
-        with torch.cuda.amp.autocast(enabled=False):
-            if flow is not None:
-                flow_resized = F.interpolate(flow, size=(H, W), mode='bilinear', align_corners=False)
-                scale = torch.tensor([flow.shape[-1] / W, flow.shape[-2] / H], device=flow.device)
-                flow_resized = flow_resized * scale.view(1, 2, 1, 1)
-                pred_prev_warp = warp(pred_prev, flow_resized.detach())
-                flo = None
-            else:
-                # Warp at native PWC resolution (H//4, W//4) to avoid flow over-smoothing
-                flo_raw = self._compute_flow_raw(img_template, img_current)     # (B,2,H/4,W/4)
-                pred_prev_low = F.avg_pool2d(pred_prev, 4, 4)                   # (B,1,H/4,W/4)
-                pred_prev_warp_low = warp(pred_prev_low, flo_raw.detach())
-                pred_prev_warp = F.interpolate(pred_prev_warp_low, (H, W),
-                                               mode='bilinear', align_corners=False)
-                # Keep upscaled flow for opt_loss / TV loss in train loop
-                flo = F.interpolate(flo_raw, (H, W), mode='bilinear', align_corners=False)
-                flo = flo * (flo_raw.shape[-2] * flo_raw.shape[-1]) / (H * W)
+                if flow is not None:
+                    flow_resized = F.interpolate(flow, size=(feat_H, feat_W), mode='bilinear', align_corners=False)
+                    scale = torch.tensor([flow.shape[-1] / feat_W, flow.shape[-2] / feat_H], device=flow.device)
+                    flow_resized = flow_resized * scale.view(1, 2, 1, 1)
+                    pred_prev_warp_low = warp(F.avg_pool2d(pred_prev, 4, 4), flow_resized.detach())
+                    flo = None
+                else:
+                    flo_raw = self._compute_flow_raw(img_template, img_current)  # (B,2,H/4,W/4)
+                    pred_prev_warp_low = warp(F.avg_pool2d(pred_prev, 4, 4), flo_raw.detach())
 
-            pred_fuse = self._fuse_dense(pred_prev_warp, pred_cur)
+                # Fuse at full resolution (256), then downpool output to 64×64
+                pred_prev_warp = F.interpolate(pred_prev_warp_low, (H, W), mode='bilinear', align_corners=False)
+                pred_fuse_256 = self._fuse_dense(pred_prev_warp, pred_cur)
 
         if return_aux:
-            return pred_fuse, flo, pred_prev_warp, pred_cur
-        return pred_fuse
+            pred_fuse = F.avg_pool2d(pred_fuse_256, 4, 4)  # (B, 1, 64, 64) for student / P2R loss
+            return pred_fuse, flo_raw, pred_prev_warp_low, F.avg_pool2d(pred_cur, 4, 4)
+        return pred_fuse_256  # (B, 1, 256, 256) for teacher — full resolution for point extraction
 
     def _fuse_dense(self, pred_prev_warp, pred_cur):
         tok_warp = self._input_adapters["density"](pred_prev_warp.float())

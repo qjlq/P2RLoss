@@ -56,6 +56,8 @@ def _check_down_factor(model, expected_down, test_size=256):
             return
 
     actual_down = test_size // out.shape[-1]
+    if actual_down == 1 and expected_down > 1:
+        return  # output at input resolution (e.g. EMAC); down is a virtual P2R scale factor
     computed = out.shape[-1] * expected_down
     if computed != test_size:
         import warnings

@@ -18,12 +18,14 @@ class L2DIS:
 
 
 class P2RLoss(nn.modules.loss._Loss):
-    def __init__(self, factor=1, reduction='mean', pos_weight=20.0) -> None:
+    def __init__(self, factor=1, reduction='mean', pos_weight=20.0,
+                 base_min_radis=8, base_max_radis=96, reference_down=1) -> None:
         super().__init__()
         self.factor = factor
         self.cost = L2DIS(1)
-        self.min_radis = 8
-        self.max_radis = 96
+        self.base_min_radis = base_min_radis
+        self.base_max_radis = base_max_radis
+        self.reference_down = reference_down
 
         self.cost_class = 1
         self.cost_point = 8
@@ -37,6 +39,11 @@ class P2RLoss(nn.modules.loss._Loss):
         nb = B_coord_chunk.size(0)
         max_N = B_coord_chunk.size(2)
         device = A_chunk.device
+
+        # Dynamic radius scaling: keep coverage constant in density-pixel space
+        scale = down / self.reference_down
+        min_radis = self.base_min_radis * scale
+        max_radis = self.base_max_radis * scale
 
         B_flat = B_coord_chunk.view(nb, max_N, 2)
         dist2 = torch.cdist(B_flat, B_flat).pow(2)
@@ -56,11 +63,11 @@ class P2RLoss(nn.modules.loss._Loss):
 
         with torch.no_grad():
             minC, mcidx = C.min(dim=-1, keepdim=True)
-            M = torch.zeros_like(C).scatter_(-1, mcidx, 1.0) * (C < self.max_radis)
+            M = torch.zeros_like(C).scatter_(-1, mcidx, 1.0) * (C < max_radis)
             M = M * point_valid_chunk.unsqueeze(-2)
 
             maxC = (minC * M).amax(dim=2, keepdim=True)
-            maxC = torch.clip(maxC, min=self.min_radis, max=self.max_radis)
+            maxC = torch.clip(maxC, min=min_radis, max=max_radis)
             C = C / maxC
 
             C = C * self.cost_point - A_chunk.view(nb, 1, HW, 1) * self.cost_class
@@ -90,6 +97,20 @@ class P2RLoss(nn.modules.loss._Loss):
         H, W = dens.shape[2], dens.shape[3]
         device = dens.device
         HW = H * W
+
+        # ── Assert: down 參數合理性 ──────────────────────────────────────────
+        # 確保 down 是正整數且密度圖解析度能被 down 整除（無餘數時合理）
+        assert isinstance(down, (int, float)) and down >= 1, f"P2RLoss: down={down} 必須 ≥ 1"
+        # 如果任何 seq 的座標最大值 > H*down 或 W*down，座標可能超出範圍
+        for i, s in enumerate(seqs):
+            if s.size(0) > 0:
+                x_max, y_max = s[:, 0].max().item(), s[:, 1].max().item()
+                if x_max >= W * down or y_max >= H * down:
+                    import warnings
+                    warnings.warn(
+                        f"P2RLoss sample {i}: seq坐标 ({x_max:.0f}, {y_max:.0f}) "
+                        f"超出密度圖({H}×{W}) × down({down}) = ({W*down}×{H*down}) 範圍"
+                    )
 
         A_coord = torch.stack(torch.meshgrid(
             torch.arange(W, device=device),

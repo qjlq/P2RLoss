@@ -62,29 +62,59 @@ def update_ema(student, teacher, alpha):
 def generate_points_from_density(density_logits, threshold=0.3, topk=None):
     """
     Extract point coordinates from a density/logits map using local-max and thresholding.
+
+    Resolution-agnostic: works with ANY (H, W) input — no hardcoded stride/scale.
+    Coordinates are returned at the SAME resolution as the input density map.
+
     Args:
-        density_logits: Tensor (B,1,H,W) logits (before sigmoid)
+        density_logits: Tensor (B, 1, H, W) logits (before sigmoid)
+        threshold:      sigmoid probability threshold for peak detection
+        topk:           if set, keep only top-k highest-probability points
     Returns:
-        list_of_points: length B list, each is Tensor (N_i, 2) in (x, y) image coordinates (pixel indices)
+        list_of_points: length B list, each is Tensor (N_i, 2) in (x, y)
     """
     prob = torch.sigmoid(density_logits)
     B, C, H, W = prob.shape
-    assert C == 1
+    assert C == 1, f"Expected 1 channel, got {C}"
+    # ── Diagnostic: confirm input resolution ────────────────────────────────
+    # (will be removed after debug, kept as permanent guard)
+    assert H > 0 and W > 0, f"Empty density map: {H}×{W}"
+
+    # Local-max NMS — kernel=3, stride=1, padding=1 preserves spatial size
     pool = F.max_pool2d(prob, kernel_size=3, stride=1, padding=1)
     peaks = (prob == pool) & (prob > threshold)
+
     points_list = []
     for b in range(B):
         ys, xs = torch.nonzero(peaks[b, 0], as_tuple=True)
         if xs.numel() == 0:
-            points_list.append(torch.zeros((0, 2), device=density_logits.device, dtype=torch.float32))
+            points_list.append(
+                torch.zeros((0, 2), device=density_logits.device, dtype=torch.float32)
+            )
             continue
-        coords = torch.stack([xs.float(), ys.float()], dim=1)  # (N, 2) as (x, y)
+        # (row, col) → (x, y) : column → x, row → y
+        coords = torch.stack([xs.float(), ys.float()], dim=1)
+
+        # ── Guard: coordinates MUST match input resolution ─────────────────
+        x_max, y_max = coords[:, 0].max().item(), coords[:, 1].max().item()
+        assert x_max < W, f"x={x_max} exceeds width={W}"
+        assert y_max < H, f"y={y_max} exceeds height={H}"
+        # Warn if coordinates don't span the full range (suggests resolution mismatch)
+        if x_max < W * 0.5 or y_max < H * 0.5:
+            import warnings as _w
+            _w.warn(
+                f"generate_points_from_density: coordinates only span "
+                f"[0, {x_max:.0f}]×[0, {y_max:.0f}] for a {H}×{W} input "
+                f"(>50% of spatial range empty). This may indicate a "
+                f"resolution mismatch upstream."
+            )
+
         if topk is not None and coords.shape[0] > topk:
-            # choose topk by probability
             vals = prob[b, 0, ys, xs]
             _, idx = vals.topk(topk)
             coords = coords[idx]
         points_list.append(coords)
+
     return points_list
 
 
@@ -282,12 +312,34 @@ def train_one_epoch(
                     lpred, _ = student(lframe, prev_h=None)
             sup_loss = p2r(lpred, ldots, down=down, pos_weight=current_pos_weight)
 
+            # ── Assert: 校驗 down 與實際輸入/輸出解析度一致 ──────────────
+            # 注意: 當輸出解析度與輸入相同（actual_ratio=1），
+            # down 為虛擬縮放因子（如 EMAC），跳過此檢查。
+            H_in, W_in = lframe.shape[-2], lframe.shape[-1]
+            H_out, W_out = lpred.shape[-2], lpred.shape[-1]
+            actual_h = H_in / H_out
+            actual_w = W_in / W_out
+            if abs(actual_h - 1) > 1e-4:
+                # 僅在實際有下採樣時校驗（例如 VGG16BN: 256→64, ratio=4）
+                assert abs(actual_h - down) < 1e-4 and abs(actual_w - down) < 1e-4, (
+                    f"\n{'='*60}\n"
+                    f"🔴 down 參數不匹配！\n"
+                    f"  輸入 ({H_in}×{W_in}) → 輸出 ({H_out}×{W_out})\n"
+                    f"  實際比例 ({actual_h:.2f}×, {actual_w:.2f}×)\n"
+                    f"  傳入 P2R 的 down={down}\n"
+                    f"  請修正模型 self.down 或傳入正確的 down 值\n"
+                    f"{'='*60}"
+                )
+            # ─────────────────────────────────────────────────────────────
+
             # ── Debug: 校驗實際降採樣率 vs self.down ──────────────────────
             Hin, Win = lframe.shape[-2], lframe.shape[-1]
             Hout, Wout = lpred.shape[-2], lpred.shape[-1]
             actual_down_h = Hin / Hout
             actual_down_w = Win / Wout
-            assert abs(actual_down_h - down) < 1e-4 and abs(actual_down_w - down) < 1e-4, (
+            if abs(actual_down_h - 1) > 1e-4:
+                # 僅在實際有下採樣時校驗（VGG16BN），EMAC 等全解析度輸出跳過
+                assert abs(actual_down_h - down) < 1e-4 and abs(actual_down_w - down) < 1e-4, (
                 f"\n{'='*60}\n"
                 f"🔴 down 參數不匹配！\n"
                 f"  模型: {model_name}\n"
@@ -342,12 +394,83 @@ def train_one_epoch(
                         )
 
                     with torch.no_grad():
-                        pseudo_thresh = 0.85 if stage == 'semi' else 0.3
+                        pseudo_thresh = 0.5 if stage == 'semi' else 0.3
                         points_prev_list = generate_points_from_density(
                             teacher_pred_prev, threshold=pseudo_thresh
                         )
 
                     seqs_for_loss = prepare_p2r_seqs_from_points_list(points_prev_list)
+
+                    # ── Debug: 可視化偽標籤（前 20 batch × 2 frame） ────────
+                    if stage == 'semi' and batch_idx < 20:
+                        if not hasattr(generate_points_from_density, '_viz_count'):
+                            generate_points_from_density._viz_count = 0
+                            generate_points_from_density._viz_dir = None
+                        if generate_points_from_density._viz_dir is None:
+                            import os as _os
+                            _tag = _os.environ.get('WANDB_NAME', 'debug')
+                            generate_points_from_density._viz_dir = f"debug_viz_{_tag}"
+                            _os.makedirs(generate_points_from_density._viz_dir, exist_ok=True)
+
+                        import matplotlib
+                        matplotlib.use('Agg')
+                        import matplotlib.pyplot as plt
+                        import numpy as np
+
+                        # ── 載入該幀的 GT 點（FDST 所有幀皆有標註） ──────────
+                        gt_frame = None
+                        try:
+                            uid_frame = uids[0]      # (video_id, frame_name)
+                            _vid, _frm = uid_frame if isinstance(uid_frame, tuple) else (None, str(uid_frame))
+                            _FDST_ROOT = '/media/SSD/OSshareSpace/localSpace/workPlace/zhongKe/gd/FDST'
+                            _gt_path = os.path.join(
+                                _FDST_ROOT, 'train_data', 'new-anno',
+                                f"GT_{_vid}_{_frm}.npy" if _vid else f"GT_{_frm}.npy"
+                            )
+                            if os.path.exists(_gt_path):
+                                gt_raw = np.load(_gt_path)[:, :2]
+                                gt_frame = gt_raw
+                            else:
+                                print(f"[DEBUG] GT file not found: {_gt_path}", flush=True)
+                        except Exception as e:
+                            print(f"[DEBUG] GT load error: {e}", flush=True)
+
+                        # 偽標籤點（augmented 空間，需 × down 映射回 256×256）
+                        pseudo_pts = seqs_for_loss[0].cpu().numpy() * down if seqs_for_loss[0].numel() > 0 else []
+
+                        # 圖片（teacher 乾淨版，augmented 256×256）
+                        img_t = uimg_batch_teacher[0, t].cpu()
+                        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                        img_show = (img_t * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+
+                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+                        # 左：augmented 影像 + 偽標籤
+                        ax1.imshow(img_show)
+                        if len(pseudo_pts) > 0:
+                            ax1.scatter(pseudo_pts[:, 0], pseudo_pts[:, 1],
+                                        c='red', s=15, alpha=0.9, linewidths=0.5, edgecolors='white')
+                        ax1.set_title(f"Pseudo-labels | n={len(pseudo_pts)} | thresh={pseudo_thresh}")
+                        ax1.axis('off')
+                        # 右：augmented 影像 + 原始 GT（若載入成功）
+                        ax2.imshow(img_show)
+                        if gt_frame is not None and len(gt_frame) > 0:
+                            ax2.scatter(gt_frame[:, 0], gt_frame[:, 1],
+                                        c='lime', s=15, alpha=0.9, linewidths=0.5, edgecolors='white',
+                                        marker='o')
+                        ax2.set_title(f"GT (raw .npy) | n={len(gt_frame) if gt_frame is not None else 0}")
+                        ax2.axis('off')
+
+                        plt.suptitle(f"epoch={epoch} batch={batch_idx} t={t} | "
+                                     f"uid={uids[0]}", fontsize=10)
+                        plt.tight_layout()
+                        fname = f"{generate_points_from_density._viz_dir}/b{batch_idx}_t{t}.png"
+                        plt.savefig(fname, dpi=120)
+                        plt.close(fig)
+                        print(f"📸 {fname} saved (pseudo={len(pseudo_pts)}, "
+                              f"gt={len(gt_frame) if gt_frame is not None else 0})", flush=True)
+                        generate_points_from_density._viz_count += 1
+                    # ── Debug End ────────────────────────────────────────────
                     with autocast(enabled=amp_enabled):
                         loss_p2r = p2r(student_pred_t, seqs_for_loss, down=down,
                                        masks=None, pos_weight=current_pos_weight)
@@ -356,15 +479,17 @@ def train_one_epoch(
                     # 1. Current-frame density loss (warped pseudo-labels)
                     loss_total = loss_p2r + sup_loss / max(T - 1, 1)
 
-                    # 2. Optical-flow photometric loss (warped RGB MSE)
+                    # 2. Optical-flow photometric loss (warped RGB MSE at 64×64)
                     if flo_t is not None:
                         perm_bgr = [2, 1, 0]
                         cur_rgb = denormalize(frame_t_teacher)[:, perm_bgr] / 255.0
                         prev_rgb = denormalize(
                             uimg_batch_teacher[:, (t + 1) % T],
                         )[:, perm_bgr] / 255.0
-                        img_warp = emac_warp(prev_rgb, flo_t)
-                        opt_loss = F.mse_loss(img_warp, cur_rgb) * 0.05
+                        cur_rgb_low = F.avg_pool2d(cur_rgb, 4, 4)
+                        prev_rgb_low = F.avg_pool2d(prev_rgb, 4, 4)
+                        img_warp = emac_warp(prev_rgb_low, flo_t)
+                        opt_loss = F.mse_loss(img_warp, cur_rgb_low) * 0.05
 
                         # 3. Flow smoothness (TV)
                         flow_tv = tv_loss(flo_t) * 0.01
@@ -412,7 +537,7 @@ def train_one_epoch(
                         student_pred_t, student_h = student(frame_t, student_h)
 
                     with torch.no_grad():
-                        pseudo_thresh = 0.85 if stage == 'semi' else 0.3
+                        pseudo_thresh = 0.5 if stage == 'semi' else 0.3
                         points_prev_list = generate_points_from_density(teacher_pred_prev, threshold=pseudo_thresh)
                         if flow_t_minus is not None:
                             warped_points_list = warp_points_with_flow(points_prev_list, flow_t_minus, flow_down=2, model_down=down)
